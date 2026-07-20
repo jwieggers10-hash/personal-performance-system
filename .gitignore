@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Runner secrets and local config (see runner/config.example.env)
+runner/config.env
+.env
+
+# Operational runtime data (see phase3-workflow-spec.md Storage section)
+runtime/
+logs/
