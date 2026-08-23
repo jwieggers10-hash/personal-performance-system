@@ -449,6 +449,64 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertIn("unexpected error", result["error"])
             self.assertFalse((repo / "runtime" / "locks" / "daily-review-2026-07-20.lock").exists())
 
+    def test_notify_skips_cleanly_when_telegram_not_configured(self):
+        # No TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID set on config (the default
+        # in make_config()) -- the Notify stage must not attempt any HTTP
+        # call and must not affect the already-decided workflow status.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+
+            with mock.patch.object(wr, "invoke_claude", return_value=self._fake_completed_process(structured)):
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertFalse(result["notification_delivered"])
+            self.assertIsNotNone(result["notification_delivery_error"])
+
+    def test_notify_failure_does_not_change_workflow_status_or_crash(self):
+        # A Telegram delivery that raises unexpectedly must never mask or
+        # invalidate an already-successful (and already-saved) review --
+        # per runner/telegram-integration.md's Delivery Failure Handling.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo, telegram_bot_token="123:fake", telegram_chat_id="1")
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+
+            with mock.patch.object(wr, "invoke_claude", return_value=self._fake_completed_process(structured)), \
+                 mock.patch.object(wr.telegram_delivery, "deliver_review", side_effect=RuntimeError("telegram boom")):
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "completed")
+            review_file = repo / result["review_file"]
+            self.assertTrue(review_file.exists())
+            self.assertFalse(result["notification_delivered"])
+            self.assertIn("telegram boom", result["notification_delivery_error"])
+            self.assertFalse((repo / "runtime" / "locks" / "daily-review-2026-07-20.lock").exists())
+
+    def test_notify_success_populates_delivery_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo, telegram_bot_token="123:fake", telegram_chat_id="1")
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+            fake_delivery = {
+                "notification_delivered": True,
+                "notification_delivery_error": None,
+                "notification_skipped": False,
+                "parts_sent": 1,
+            }
+
+            with mock.patch.object(wr, "invoke_claude", return_value=self._fake_completed_process(structured)), \
+                 mock.patch.object(wr.telegram_delivery, "deliver_review", return_value=fake_delivery):
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertTrue(result["notification_delivered"])
+            self.assertIsNone(result["notification_delivery_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

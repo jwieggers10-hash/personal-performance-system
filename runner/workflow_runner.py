@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """Reusable non-interactive workflow runner.
 
-Implements the Execution Lifecycle defined in runner/workflow-runner.md:
+Implements the Execution Lifecycle defined in runner/workflow-runner.md,
+extended with the Notify stage from runner/telegram-integration.md:
 
     Initialize -> Validate environment -> Acquire workflow lock -> Load workflow
     -> Execute Claude -> Validate structured output -> Write review
-    -> Release lock -> Return status
+    -> Notify (Telegram) -> Release lock -> Return status
 
 This script contains no coaching logic. All reasoning, philosophy compliance,
 and output structure belong to the workflow definition under workflows/*.md,
 which Claude Code reads and executes. The runner's job is orchestration only:
-invoke, validate, store, report.
+invoke, validate, store, report. Telegram delivery (see telegram_delivery.py)
+is a separate, one-way dependency of this module -- it never runs coaching
+logic and a delivery failure never invalidates an already-saved review.
 
 Governing documents for this implementation:
     phase3-workflow-spec.md, workflows/daily-review.md, runner/README.md,
-    runner/workflow-runner.md, constraints.md, data-source-policy.md,
-    integration-status.md, CLAUDE.md
+    runner/workflow-runner.md, runner/telegram-integration.md, constraints.md,
+    data-source-policy.md, integration-status.md, CLAUDE.md
 
 Usage:
     python3 runner/workflow_runner.py --workflow daily-review --mode automated
@@ -41,6 +44,8 @@ try:
     from zoneinfo import ZoneInfo
 except ImportError as exc:  # pragma: no cover - Python 3.9+ ships zoneinfo
     raise RuntimeError("Python 3.9+ (with zoneinfo) is required") from exc
+
+import telegram_delivery
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +165,8 @@ class RunnerConfig:
     allowed_tools: str = DEFAULT_ALLOWED_TOOLS
     lock_stale_seconds: int = DEFAULT_LOCK_STALE_SECONDS
     log_file: Optional[Path] = None
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str], repo_root_override: Optional[str] = None) -> "RunnerConfig":
@@ -196,6 +203,8 @@ class RunnerConfig:
             allowed_tools=env.get("CLAUDE_ALLOWED_TOOLS", DEFAULT_ALLOWED_TOOLS) or DEFAULT_ALLOWED_TOOLS,
             lock_stale_seconds=int(env.get("LOCK_STALE_SECONDS", DEFAULT_LOCK_STALE_SECONDS)),
             log_file=(Path(log_file_value) if log_file_value else None),
+            telegram_bot_token=(env.get("TELEGRAM_BOT_TOKEN", "").strip() or None),
+            telegram_chat_id=(env.get("TELEGRAM_CHAT_ID", "").strip() or None),
         )
 
 
@@ -600,6 +609,12 @@ def run_workflow(
         "confidence": None,
         "limitations": [],
         "error": None,
+        # Set for real only in the finally block below, for executions that
+        # actually reached the Notify stage (i.e. held the workflow lock).
+        # Left at these defaults for early rejections (invalid mode, unknown
+        # workflow, etc.) where no delivery was ever attempted.
+        "notification_delivered": False,
+        "notification_delivery_error": None,
     }
 
     if execution_mode not in VALID_EXECUTION_MODES:
@@ -698,7 +713,11 @@ def run_workflow(
             return result
 
         # Structured output is valid -- adopt its coaching-facing fields.
-        for key in ("confidence", "notification_level", "notification_required", "limitations"):
+        # recommendation_summary is a workflow-specific field (not part of
+        # the runner's own envelope contract) carried through only so the
+        # Notify stage has a short summary to deliver.
+        for key in ("confidence", "notification_level", "notification_required", "limitations",
+                    "recommendation_summary"):
             if key in structured:
                 result[key] = structured[key]
 
@@ -738,6 +757,21 @@ def run_workflow(
         return result
     finally:
         result["finished_at"] = datetime.now(dt_timezone.utc).isoformat()
+        # Notify stage (runner/telegram-integration.md): attempted for every
+        # execution that reached this point, after the review is already
+        # durably saved (or the run otherwise reached a terminal state) and
+        # before the lock is released. A delivery failure -- or Telegram not
+        # being configured at all, the normal state today -- must never
+        # crash the workflow or change its already-decided status.
+        try:
+            delivery = telegram_delivery.deliver_review(
+                result, config.telegram_bot_token, config.telegram_chat_id,
+            )
+            result["notification_delivered"] = delivery["notification_delivered"]
+            result["notification_delivery_error"] = delivery["notification_delivery_error"]
+        except Exception as exc:  # noqa: BLE001 -- notification must never mask the workflow result
+            result["notification_delivered"] = False
+            result["notification_delivery_error"] = redact_secrets(f"unexpected notify error: {exc}")
         lock.release()
 
 
