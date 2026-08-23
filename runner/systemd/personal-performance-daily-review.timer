@@ -1,0 +1,26 @@
+[Unit]
+Description=Daily trigger for Personal Performance Daily Review (07:00 Europe/Amsterdam)
+
+[Timer]
+# The explicit "Europe/Amsterdam" suffix makes this trigger DST-aware and
+# independent of the server's own system timezone (this server runs UTC).
+# systemd resolves this against the IANA tzdata, so it fires at 05:00 UTC
+# in summer (CEST, UTC+2) and 06:00 UTC in winter (CET, UTC+1) -- always
+# 07:00 local Amsterdam time. This must stay in sync with ATHLETE_TIMEZONE
+# in runner/config.env, which governs what local date the runner itself
+# computes for the review filename.
+OnCalendar=*-*-* 07:00:00 Europe/Amsterdam
+
+# Default scheduling jitter window; explicit here for clarity.
+AccuracySec=1min
+
+# If the server was off/unreachable at 07:00 (reboot, outage), run once
+# as soon as possible after it's back -- rather than silently skipping
+# that day's review. Does not queue up multiple missed runs, only the
+# most recent one.
+Persistent=true
+
+Unit=personal-performance-daily-review.service
+
+[Install]
+WantedBy=timers.target

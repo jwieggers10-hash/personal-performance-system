@@ -1,0 +1,43 @@
+[Unit]
+Description=Personal Performance System - Daily Review (automated, one-shot)
+Documentation=file:///home/coach/personal-performance-system/phase3-workflow-spec.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=coach
+Group=coach
+WorkingDirectory=/home/coach/personal-performance-system
+
+# Server-local, non-secret runner config. Permissions must stay 600,
+# owned by coach:coach -- systemd (PID 1, effectively root) reads this
+# file before dropping privileges to User=coach, so root can read it
+# regardless of its restrictive mode; no other unprivileged user on the
+# box can. As of this deployment this file carries no real secrets (the
+# AthleteData MCP key lives only in coach's own `claude mcp` local
+# registration, never in this file or this unit).
+EnvironmentFile=/home/coach/personal-performance-system/runner/config.env
+
+ExecStart=/usr/bin/python3 runner/workflow_runner.py --workflow daily-review --mode automated
+
+# No automatic restart: per runner/workflow-runner.md's Failure Handling
+# section, retrying a failed/timed-out execution is a decision made
+# outside the single execution, not something the runner or this unit
+# does automatically.
+Restart=no
+
+# The runner bounds the Claude invocation itself via CLAUDE_TIMEOUT_SECONDS
+# in config.env (subprocess.run(timeout=...)) and always exits cleanly
+# afterward. Left uncapped here so systemd's own default start timeout
+# never races that internal timeout and kills the process first.
+TimeoutStartSec=infinity
+
+# This account never needs elevated privileges.
+NoNewPrivileges=true
+
+SyslogIdentifier=daily-review
+
+# No [Install] section: this service is only ever started by
+# personal-performance-daily-review.timer, never enabled or started
+# directly.
