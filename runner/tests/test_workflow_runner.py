@@ -10,6 +10,7 @@ the workflow definition, not exercised here).
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -169,6 +170,37 @@ class BuildPromptTests(unittest.TestCase):
                 athlete_context="sore calves",
             )
             self.assertIn("sore calves", prompt)
+
+
+class InvokeClaudeArgvTests(unittest.TestCase):
+    """Regression coverage for the --allowedTools/prompt argv-swallowing bug:
+    --allowedTools is variadic in the Claude Code CLI (<tools...>), so passing
+    it and its value as two separate argv elements lets it consume whatever
+    argv element follows -- including the prompt itself, if the prompt were
+    also passed as a bare trailing element. Unlike other invoke_claude()
+    coverage, this test mocks subprocess.run directly (not invoke_claude) so
+    it actually exercises the argv list being built."""
+
+    def _fake_completed_process(self):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
+
+    def test_allowed_tools_passed_as_single_argv_element_with_equals(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo, allowed_tools="Read,mcp__athletedata__*")
+            with mock.patch.object(wr.subprocess, "run", return_value=self._fake_completed_process()) as mocked_run:
+                wr.invoke_claude("the prompt text", config)
+
+            argv = mocked_run.call_args.args[0]
+
+            # The flag and its value must be one argv element, not two --
+            # otherwise the variadic parser would absorb the next element.
+            self.assertIn("--allowedTools=Read,mcp__athletedata__*", argv)
+            self.assertNotIn("--allowedTools", argv)
+
+            # The prompt must survive as its own final argv element, distinct
+            # from the allowedTools value.
+            self.assertEqual(argv[-1], "the prompt text")
 
 
 class WorkflowLockTests(unittest.TestCase):

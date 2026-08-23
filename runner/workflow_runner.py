@@ -427,7 +427,10 @@ def invoke_claude(prompt: str, config: RunnerConfig) -> subprocess.CompletedProc
         "--print",
         "--output-format", "json",
         "--permission-mode", config.permission_mode,
-        "--allowedTools", config.allowed_tools,
+        # --allowedTools is variadic in the Claude Code CLI (accepts <tools...>);
+        # passed as two argv elements it would swallow the prompt argument that
+        # follows. The "=" form keeps it a single argv element.
+        f"--allowedTools={config.allowed_tools}",
     ]
     if config.claude_model:
         argv += ["--model", config.claude_model]
