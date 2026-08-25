@@ -92,6 +92,11 @@ DEFAULT_CLAUDE_BINARY = "claude"
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 DEFAULT_ALLOWED_TOOLS = "Read,mcp__athletedata__*"
 
+# At most one retry, and only for a malformed/invalid structured response --
+# never for a timeout, a nonzero Claude CLI exit, or any other failure mode.
+# See build_retry_prompt() and the retry loop in run_workflow().
+MAX_CLAUDE_ATTEMPTS = 2
+
 # Redact anything that looks like a secret-bearing query param or bearer token
 # before it can reach a log line or an error field. Belt-and-suspenders on top
 # of never passing secrets into strings we log in the first place.
@@ -329,6 +334,31 @@ as defined in the workflow -- do not invent an answer.
 """
 
 
+def build_retry_prompt(original_prompt: str, issue: str) -> str:
+    """Builds the corrective prompt for the single permitted retry when
+    Claude's previous response violated the structured-output contract
+    (malformed JSON, or a validate_structured_result() failure).
+
+    This is a fresh, independent Claude invocation -- not a resumed session --
+    so it carries no memory of the prior attempt. The correction below says so
+    plainly (asking Claude to redo the whole task, including data retrieval)
+    rather than implying a continuity that doesn't exist.
+    """
+    return (
+        f"{original_prompt}\n"
+        "---\n"
+        "IMPORTANT: A previous attempt at this exact task failed because its final "
+        "response violated the required structured-output contract above and could "
+        "not be used. The specific problem was:\n"
+        f"{redact_secrets(issue)}\n\n"
+        "This is a fresh attempt with no memory of the previous one -- complete the "
+        "task again in full (retrieve fresh AthleteData, analyze it per the governing "
+        "documents, as instructed above). This time, make sure your final message is "
+        "ONLY the raw JSON object described above: no markdown code fences, no "
+        "explanatory text before or after it, and nothing else.\n"
+    )
+
+
 # --------------------------------------------------------------------------
 # Locking
 # --------------------------------------------------------------------------
@@ -430,6 +460,55 @@ def _pid_is_running(pid: int) -> bool:
 # Claude invocation
 # --------------------------------------------------------------------------
 
+# Fields whose *value* is constrained beyond "some string" -- driven by the
+# same VALID_* constants validate_structured_result() checks against, so the
+# CLI-enforced schema below and the runner's own semantic validation can
+# never silently drift apart.
+_SCHEMA_ENUM_FIELDS = {
+    "status": sorted(VALID_STATUSES),
+    "execution_mode": sorted(VALID_EXECUTION_MODES),
+    "confidence": sorted(VALID_CONFIDENCE),
+    "notification_level": sorted(VALID_NOTIFICATION_LEVELS),
+}
+_SCHEMA_ARRAY_OF_STRING_FIELDS = {"limitations", "missing_data", "integration_failures"}
+_SCHEMA_BOOLEAN_FIELDS = {"notification_required"}
+
+# Fields the runner itself supplies/validates rather than requiring them from
+# Claude -- mirrors validate_structured_result()'s own exclusion list exactly
+# (see the loop over RUNNER_ENVELOPE_FIELDS at the top of that function).
+_SCHEMA_RUNNER_SUPPLIED_FIELDS = {"execution_id", "started_at", "finished_at", "review_file", "error"}
+
+
+def build_structured_output_json_schema() -> dict:
+    """JSON Schema passed to `claude --json-schema`, built directly from this
+    module's own envelope/enum constants (RUNNER_ENVELOPE_FIELDS,
+    WORKFLOW_RESULT_FIELDS, VALID_*) so CLI-level schema enforcement can never
+    silently drift from validate_structured_result()'s semantic checks below.
+
+    This schema enforces shape, type, and enum membership only -- it is a
+    first line of defense, not a replacement for validate_structured_result(),
+    which still runs unchanged on whatever comes back from Claude.
+    """
+    all_fields = list(RUNNER_ENVELOPE_FIELDS) + list(WORKFLOW_RESULT_FIELDS) + ["human_readable_review"]
+
+    properties: dict = {}
+    for field_name in all_fields:
+        if field_name in _SCHEMA_ENUM_FIELDS:
+            properties[field_name] = {"type": "string", "enum": _SCHEMA_ENUM_FIELDS[field_name]}
+        elif field_name in _SCHEMA_ARRAY_OF_STRING_FIELDS:
+            properties[field_name] = {"type": "array", "items": {"type": "string"}}
+        elif field_name in _SCHEMA_BOOLEAN_FIELDS:
+            properties[field_name] = {"type": "boolean"}
+        elif field_name == "human_readable_review":
+            properties[field_name] = {"type": "string"}
+        else:
+            properties[field_name] = {"type": ["string", "null"]}
+
+    required = [f for f in all_fields if f not in _SCHEMA_RUNNER_SUPPLIED_FIELDS]
+
+    return {"type": "object", "properties": properties, "required": required}
+
+
 def invoke_claude(prompt: str, config: RunnerConfig) -> subprocess.CompletedProcess:
     argv = [
         config.claude_binary,
@@ -440,6 +519,10 @@ def invoke_claude(prompt: str, config: RunnerConfig) -> subprocess.CompletedProc
         # passed as two argv elements it would swallow the prompt argument that
         # follows. The "=" form keeps it a single argv element.
         f"--allowedTools={config.allowed_tools}",
+        # --json-schema is a single-value (non-variadic) flag, so it's safe as
+        # two argv elements. Enforces the Structured Result Contract's shape
+        # at the CLI boundary -- see build_structured_output_json_schema().
+        "--json-schema", json.dumps(build_structured_output_json_schema()),
     ]
     if config.claude_model:
         argv += ["--model", config.claude_model]
@@ -457,15 +540,22 @@ def invoke_claude(prompt: str, config: RunnerConfig) -> subprocess.CompletedProc
 
 
 def parse_claude_output(raw_stdout: str) -> dict:
-    """Defensively parse Claude's --output-format json response. The CLI
-    wraps the final answer text in an outer object (typically under a
-    "result" key); the answer text itself is expected to be the JSON object
-    this workflow was asked to produce. Both layers are handled, and any
-    failure is reported as malformed output rather than guessed at."""
+    """Defensively parse Claude's --output-format json response. When
+    --json-schema was honored, the CLI provides an already-validated
+    "structured_output" object directly on the outer response -- preferred
+    here since it needs no further JSON parsing and is guaranteed schema-valid
+    by the CLI itself. Otherwise, falls back to the older path: the outer
+    object wraps the final answer text under a "result" key, and that text is
+    expected to itself be the JSON object this workflow was asked to produce.
+    Any failure at either layer is reported as malformed output rather than
+    guessed at -- no fence-stripping, no permissive repair."""
     try:
         outer = json.loads(raw_stdout)
     except json.JSONDecodeError as exc:
         raise MalformedOutputError(f"Claude output was not valid JSON: {redact_secrets(str(exc))}") from exc
+
+    if isinstance(outer, dict) and isinstance(outer.get("structured_output"), dict):
+        return outer["structured_output"]
 
     candidate: Any = outer
     if isinstance(outer, dict) and isinstance(outer.get("result"), str):
@@ -675,42 +765,64 @@ def run_workflow(
             athlete_context=athlete_context,
         )
 
-        log_event(config, event="claude_invoke_start", workflow=workflow_name, execution_id=exec_id)
-        try:
-            completed = invoke_claude(prompt, config)
-        except subprocess.TimeoutExpired:
-            result["error"] = "Claude execution timed out"
-            log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                      status="failed", error_category="timeout")
-            return result
-        except FileNotFoundError as exc:
-            result["error"] = f"Claude binary not found: {redact_secrets(str(exc))}"
-            log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                      status="failed", error_category="claude_not_found")
-            return result
+        # Execute Claude -> Validate structured output, with at most one
+        # bounded, explicitly-corrective retry (MAX_CLAUDE_ATTEMPTS) when the
+        # response is malformed JSON or fails validate_structured_result().
+        # Every other failure mode (timeout, missing binary, nonzero exit)
+        # returns immediately below, without retrying -- retrying those would
+        # not fix the underlying problem and is explicitly out of scope for
+        # this loop. The loop reuses the same workflow execution and lock
+        # (already acquired above); it never writes a review file or sends a
+        # notification itself -- those stages, reached at most once each, are
+        # unchanged and still happen only after the loop below produces a
+        # validated `structured` result.
+        attempt_prompt = prompt
+        structured: Optional[dict] = None
+        last_structural_error: Optional[str] = None
 
-        if completed.returncode != 0:
-            result["error"] = redact_secrets(
-                f"Claude exited with status {completed.returncode}: {completed.stderr.strip()[:500]}"
-            )
-            log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                      status="failed", error_category="claude_execution_failure")
-            return result
+        for attempt in range(1, MAX_CLAUDE_ATTEMPTS + 1):
+            log_event(config, event="claude_invoke_start", workflow=workflow_name, execution_id=exec_id,
+                      attempt=attempt)
+            try:
+                completed = invoke_claude(attempt_prompt, config)
+            except subprocess.TimeoutExpired:
+                result["error"] = "Claude execution timed out"
+                log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
+                          status="failed", error_category="timeout", attempt=attempt)
+                return result
+            except FileNotFoundError as exc:
+                result["error"] = f"Claude binary not found: {redact_secrets(str(exc))}"
+                log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
+                          status="failed", error_category="claude_not_found", attempt=attempt)
+                return result
 
-        try:
-            structured = parse_claude_output(completed.stdout)
-        except MalformedOutputError as exc:
-            result["error"] = str(exc)
-            log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                      status="failed", error_category="malformed_output")
-            return result
+            if completed.returncode != 0:
+                result["error"] = redact_secrets(
+                    f"Claude exited with status {completed.returncode}: {completed.stderr.strip()[:500]}"
+                )
+                log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
+                          status="failed", error_category="claude_execution_failure", attempt=attempt)
+                return result
 
-        problems = validate_structured_result(structured, workflow_name, execution_mode, local_date)
-        if problems:
-            result["error"] = "structured output failed validation: " + "; ".join(problems)
-            log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                      status="failed", error_category="malformed_output")
-            return result
+            try:
+                candidate = parse_claude_output(completed.stdout)
+                problems = validate_structured_result(candidate, workflow_name, execution_mode, local_date)
+                if problems:
+                    raise MalformedOutputError("structured output failed validation: " + "; ".join(problems))
+            except MalformedOutputError as exc:
+                last_structural_error = str(exc)
+                if attempt < MAX_CLAUDE_ATTEMPTS:
+                    log_event(config, event="malformed_output_retry", workflow=workflow_name,
+                              execution_id=exec_id, attempt=attempt, issue=last_structural_error)
+                    attempt_prompt = build_retry_prompt(prompt, last_structural_error)
+                    continue
+                result["error"] = last_structural_error
+                log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
+                          status="failed", error_category="malformed_output", attempts=attempt)
+                return result
+
+            structured = candidate
+            break
 
         # Structured output is valid -- adopt its coaching-facing fields.
         # recommendation_summary is a workflow-specific field (not part of

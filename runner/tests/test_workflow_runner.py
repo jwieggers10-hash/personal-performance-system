@@ -202,6 +202,55 @@ class InvokeClaudeArgvTests(unittest.TestCase):
             # from the allowedTools value.
             self.assertEqual(argv[-1], "the prompt text")
 
+    def test_json_schema_flag_passed_and_matches_schema_builder(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            with mock.patch.object(wr.subprocess, "run", return_value=self._fake_completed_process()) as mocked_run:
+                wr.invoke_claude("the prompt text", config)
+
+            argv = mocked_run.call_args.args[0]
+
+            self.assertIn("--json-schema", argv)
+            schema_value = argv[argv.index("--json-schema") + 1]
+            self.assertEqual(json.loads(schema_value), wr.build_structured_output_json_schema())
+
+            # The prompt must still survive as the final argv element.
+            self.assertEqual(argv[-1], "the prompt text")
+
+
+class BuildStructuredOutputJsonSchemaTests(unittest.TestCase):
+    """These tests exist specifically to catch drift between the CLI-enforced
+    schema and validate_structured_result()'s own semantic checks -- both
+    must stay derived from the same RUNNER_ENVELOPE_FIELDS / WORKFLOW_RESULT_
+    FIELDS / VALID_* constants."""
+
+    def test_required_fields_match_non_runner_supplied_envelope_fields(self):
+        schema = wr.build_structured_output_json_schema()
+        expected_required = (
+            set(wr.RUNNER_ENVELOPE_FIELDS) | set(wr.WORKFLOW_RESULT_FIELDS) | {"human_readable_review"}
+        ) - {"execution_id", "started_at", "finished_at", "review_file", "error"}
+        self.assertEqual(set(schema["required"]), expected_required)
+
+    def test_enum_properties_match_valid_value_constants(self):
+        schema = wr.build_structured_output_json_schema()
+        self.assertEqual(set(schema["properties"]["status"]["enum"]), wr.VALID_STATUSES)
+        self.assertEqual(set(schema["properties"]["execution_mode"]["enum"]), wr.VALID_EXECUTION_MODES)
+        self.assertEqual(set(schema["properties"]["confidence"]["enum"]), wr.VALID_CONFIDENCE)
+        self.assertEqual(set(schema["properties"]["notification_level"]["enum"]), wr.VALID_NOTIFICATION_LEVELS)
+
+
+class BuildRetryPromptTests(unittest.TestCase):
+    def test_includes_original_prompt_and_specific_issue(self):
+        retry_prompt = wr.build_retry_prompt("ORIGINAL PROMPT TEXT", "some specific validation issue")
+        self.assertIn("ORIGINAL PROMPT TEXT", retry_prompt)
+        self.assertIn("some specific validation issue", retry_prompt)
+        self.assertIn("violated the required structured-output contract", retry_prompt)
+
+    def test_redacts_secrets_in_the_issue_text(self):
+        retry_prompt = wr.build_retry_prompt("ORIGINAL", "leaked apiKey=sk_soma_shouldnotleak in error")
+        self.assertNotIn("sk_soma_shouldnotleak", retry_prompt)
+
 
 class WorkflowLockTests(unittest.TestCase):
     def test_acquire_and_release_round_trip(self):
@@ -267,6 +316,20 @@ class ParseClaudeOutputTests(unittest.TestCase):
         outer = json.dumps({"result": "not json either"})
         with self.assertRaises(wr.MalformedOutputError):
             wr.parse_claude_output(outer)
+
+    def test_prefers_structured_output_over_result_string(self):
+        inner = valid_structured_result()
+        # A deliberately-broken "result" string proves structured_output wins
+        # rather than being a fallback that's merely tried first.
+        outer = json.dumps({"result": "not json at all", "structured_output": inner})
+        parsed = wr.parse_claude_output(outer)
+        self.assertEqual(parsed, inner)
+
+    def test_falls_back_to_result_string_when_structured_output_absent(self):
+        inner = valid_structured_result()
+        outer = json.dumps({"result": json.dumps(inner)})
+        parsed = wr.parse_claude_output(outer)
+        self.assertEqual(parsed, inner)
 
 
 class ValidateStructuredResultTests(unittest.TestCase):
@@ -360,6 +423,127 @@ class RunWorkflowTests(unittest.TestCase):
             # lock must be released after a successful run
             self.assertFalse((repo / "runtime" / "locks" / "daily-review-2026-07-20.lock").exists())
 
+    def test_valid_first_attempt_invokes_claude_exactly_once(self):
+        # A valid first response must never trigger the retry path.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+
+            with mock.patch.object(wr, "invoke_claude",
+                                    return_value=self._fake_completed_process(structured)) as mocked:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_malformed_first_attempt_retries_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+            bad_process = mock.Mock(returncode=0, stdout="not json", stderr="")
+            good_process = self._fake_completed_process(structured)
+            fake_delivery = {"notification_delivered": True, "notification_delivery_error": None,
+                              "notification_skipped": False, "parts_sent": 1}
+
+            with mock.patch.object(wr, "invoke_claude", side_effect=[bad_process, good_process]) as mocked_invoke, \
+                 mock.patch.object(wr.telegram_delivery, "deliver_review", return_value=fake_delivery) as mocked_notify:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(mocked_invoke.call_count, 2)
+            review_file = repo / result["review_file"]
+            self.assertTrue(review_file.exists())
+            # Exactly one review write and one notification, even though two
+            # Claude attempts occurred.
+            self.assertEqual(mocked_notify.call_count, 1)
+
+    def test_failed_validation_first_attempt_retries_and_succeeds(self):
+        # Distinct from malformed JSON: the first attempt is valid JSON that
+        # fails validate_structured_result() (missing a required field).
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            invalid_structured = valid_structured_result(local_date="2026-07-20")
+            del invalid_structured["confidence"]
+            invalid_process = mock.Mock(
+                returncode=0, stdout=json.dumps({"result": json.dumps(invalid_structured)}), stderr=""
+            )
+            good_structured = valid_structured_result(local_date="2026-07-20")
+            good_process = self._fake_completed_process(good_structured)
+            fake_delivery = {"notification_delivered": True, "notification_delivery_error": None,
+                              "notification_skipped": False, "parts_sent": 1}
+
+            with mock.patch.object(wr, "invoke_claude",
+                                    side_effect=[invalid_process, good_process]) as mocked_invoke, \
+                 mock.patch.object(wr.telegram_delivery, "deliver_review", return_value=fake_delivery) as mocked_notify:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(mocked_invoke.call_count, 2)
+            review_file = repo / result["review_file"]
+            self.assertTrue(review_file.exists())
+            self.assertEqual(mocked_notify.call_count, 1)
+
+    def test_retry_prompt_states_previous_contract_violation(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+            bad_process = mock.Mock(returncode=0, stdout="not json", stderr="")
+            good_process = self._fake_completed_process(structured)
+
+            with mock.patch.object(wr, "invoke_claude", side_effect=[bad_process, good_process]) as mocked_invoke:
+                wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(mocked_invoke.call_count, 2)
+            second_call_prompt = mocked_invoke.call_args_list[1].args[0]
+            self.assertIn("violated the required structured-output contract", second_call_prompt)
+            self.assertIn("not valid JSON", second_call_prompt)
+
+    def test_both_attempts_malformed_fails_after_exactly_two_attempts(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            bad_process = mock.Mock(returncode=0, stdout="not json", stderr="")
+            fake_delivery = {"notification_delivered": True, "notification_delivery_error": None,
+                              "notification_skipped": False, "parts_sent": 1}
+
+            with mock.patch.object(wr, "invoke_claude", side_effect=[bad_process, bad_process]) as mocked_invoke, \
+                 mock.patch.object(wr.telegram_delivery, "deliver_review", return_value=fake_delivery) as mocked_notify:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIsNotNone(result["error"])
+            self.assertEqual(mocked_invoke.call_count, 2)
+            self.assertFalse((repo / "reviews" / "daily" / "2026-07-20.md").exists())
+            # Existing failed-workflow + urgent failure-notification behavior
+            # is preserved: exactly one notification, at urgent priority.
+            self.assertEqual(mocked_notify.call_count, 1)
+            self.assertEqual(result["notification_level"], "urgent")
+            self.assertTrue(result["notification_required"])
+
+    def test_timeout_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+
+            with mock.patch.object(
+                wr, "invoke_claude", side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=600)
+            ) as mocked_invoke:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("timed out", result["error"])
+            self.assertEqual(mocked_invoke.call_count, 1)
+
     def test_duplicate_lock_short_circuits_without_invoking_claude(self):
         with tempfile.TemporaryDirectory() as td:
             repo = make_repo(Path(td))
@@ -394,18 +578,22 @@ class RunWorkflowTests(unittest.TestCase):
             self.assertEqual(existing.read_text(encoding="utf-8"), "already here")
 
     def test_malformed_claude_output_reports_failed(self):
+        # invoke_claude's mock returns the same malformed output on every
+        # call, so this also exercises "both attempts malformed" -- the
+        # retry is attempted (call_count == 2) and still ends up failed.
         with tempfile.TemporaryDirectory() as td:
             repo = make_repo(Path(td))
             config = make_config(repo)
             fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
             bad_process = mock.Mock(returncode=0, stdout="not json", stderr="")
 
-            with mock.patch.object(wr, "invoke_claude", return_value=bad_process):
+            with mock.patch.object(wr, "invoke_claude", return_value=bad_process) as mocked_invoke:
                 result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
 
             self.assertEqual(result["status"], "failed")
             self.assertIsNotNone(result["error"])
             self.assertFalse((repo / "reviews" / "daily" / "2026-07-20.md").exists())
+            self.assertEqual(mocked_invoke.call_count, 2)
 
     def test_claude_nonzero_exit_reports_failed_without_leaking_secrets(self):
         with tempfile.TemporaryDirectory() as td:
@@ -414,11 +602,14 @@ class RunWorkflowTests(unittest.TestCase):
             fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
             failing = mock.Mock(returncode=1, stdout="", stderr="auth error apiKey=sk_soma_shouldnotleak")
 
-            with mock.patch.object(wr, "invoke_claude", return_value=failing):
+            with mock.patch.object(wr, "invoke_claude", return_value=failing) as mocked_invoke:
                 result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
 
             self.assertEqual(result["status"], "failed")
             self.assertNotIn("sk_soma_shouldnotleak", result["error"])
+            # A nonzero CLI exit is a distinct failure mode from malformed
+            # output and must never trigger the retry.
+            self.assertEqual(mocked_invoke.call_count, 1)
 
     def test_unknown_workflow_reports_failed(self):
         with tempfile.TemporaryDirectory() as td:

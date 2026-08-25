@@ -83,6 +83,14 @@ This is the runner's outer envelope — the execution metadata common to any wor
 
 No final serialization format is chosen at this stage. The field contract above exists so a future implementation has something precise to validate against.
 
+### Structured-Output Enforcement and Retry
+
+Claude Code's `--json-schema` flag is used at the CLI boundary to enforce the shape of the Structured Result Contract (required fields, enum values, and value types) at generation time. The schema is built programmatically from the runner's own envelope/enum constants, so the CLI-enforced schema can never silently drift from the semantic validation performed afterward. Schema enforcement is a first line of defense only — it does not replace the runner's own semantic validation (the specific `workflow`, `execution_mode`, and `local_date` for this run must match; `human_readable_review` must actually be present), which still runs unchanged on every response.
+
+If Claude's response is malformed JSON, or fails semantic validation, the runner performs at most one bounded retry within the same execution: a fresh Claude invocation, carrying the original prompt plus a concise, explicit statement that the previous response violated the required output contract and the specific reason why, requesting a corrected response only. No more than two total Claude invocations occur per execution. The retry happens entirely within the same workflow lock and execution — it never re-acquires the lock, and never writes a review file or sends a notification on its own; those stages are reached, at most once each, only after a response has fully validated (from either attempt), exactly as for a single-attempt run. If both attempts fail validation, the execution reports `failed` and the existing urgent failure-notification path applies unchanged.
+
+This retry is reserved strictly for a malformed/invalid structured response. A timeout, a nonzero Claude CLI exit, an AthleteData failure surfaced through Claude's own structured output, a review-file write failure, or a Telegram delivery failure are each a distinct failure mode with their own handling below and are never retried by this mechanism.
+
 ---
 
 ## Locking
@@ -116,7 +124,7 @@ The runner must account for:
 
 - **Claude failure** — the invocation itself fails or errors out. Recorded as a failed execution; no review file is written or overwritten.
 - **AthleteData failure** — one or more integrations are unavailable. This is not automatically a runner-level failure; the workflow definition decides whether the result is `completed_with_limitations` or something more severe. The runner's job is to make sure that decision is possible, not to make it.
-- **Malformed output** — Claude returns output that doesn't match the Structured Result Contract. Treated as a failed execution rather than passed through and trusted.
+- **Malformed output** — Claude returns output that doesn't match the Structured Result Contract. The runner allows at most one bounded, explicitly-corrective retry (see Structured-Output Enforcement and Retry above) before treating it as a failed execution; malformed output is never passed through and trusted, on either attempt.
 - **Storage failure** — the review file cannot be written. Never reported as a successful completion.
 - **Timeout** — the execution exceeds its allotted time. Terminated, recorded as a failed or timed-out execution, and the lock is released rather than left held.
 - **Duplicate execution** — a second execution for the same workflow-run is attempted while one is already in progress or already completed. Detected via the lock (in-progress case) or via the idempotency rule the workflow defines (already-completed case), and reported as `duplicate_skipped` rather than run again.

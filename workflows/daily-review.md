@@ -376,6 +376,8 @@ Allowed values:
 
 The human-readable review and the structured result must agree with each other. A final serialization format is not chosen at this stage, but the field contract above is precise enough for the future runner to validate against.
 
+The runner enforces this contract at the Claude CLI boundary via JSON Schema, and performs at most one bounded, explicitly-corrective retry if a response is malformed or fails validation (see `runner/workflow-runner.md`'s Structured-Output Enforcement and Retry section). No review file is written and no coaching notification is sent until a response fully validates.
+
 ---
 
 ## Notification Rules
@@ -445,6 +447,7 @@ Rules:
 - Conclusions depending on the failed source must be withheld.
 - If enough data remains, return `completed_with_limitations`.
 - If a responsible recommendation cannot be made, use `more_information_needed`.
+- Malformed or invalid structured output is retried at most once, with an explicit correction, before being treated as a failed execution (see `runner/workflow-runner.md`).
 - Telegram delivery failure must not invalidate a successfully saved review.
 - Errors must not include secrets or raw authorization URLs.
 
