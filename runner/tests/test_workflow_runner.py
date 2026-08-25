@@ -171,6 +171,29 @@ class BuildPromptTests(unittest.TestCase):
             )
             self.assertIn("sore calves", prompt)
 
+    def test_prompt_never_instructs_literal_backslash_n_for_line_breaks(self):
+        # Regression guard: build_prompt() previously told Claude to "use \n
+        # for line breaks" in human_readable_review, which -- under the
+        # --json-schema/tool-call structured-output path -- was observed in
+        # production to make Claude write the literal two-character sequence
+        # backslash-n into the field instead of an actual line break. The
+        # instruction must require real newlines and must not tell Claude to
+        # type an escape sequence.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            prompt = wr.build_prompt(
+                workflow_name="daily-review",
+                workflow_file=repo / "workflows" / "daily-review.md",
+                governing_documents=[],
+                execution_mode="automated",
+                local_date=date(2026, 7, 20),
+                athlete_timezone="Europe/Amsterdam",
+                athlete_context=None,
+            )
+            self.assertNotIn("use \\n for line breaks", prompt)
+            self.assertIn("real, actual line breaks", prompt)
+            self.assertIn("never the literal two-character sequence", prompt)
+
 
 class InvokeClaudeArgvTests(unittest.TestCase):
     """Regression coverage for the --allowedTools/prompt argv-swallowing bug:
@@ -437,6 +460,30 @@ class RunWorkflowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed")
             self.assertEqual(mocked.call_count, 1)
+
+    def test_review_file_contains_real_newlines_not_literal_backslash_n(self):
+        # Regression test for the production newline defect: a successfully
+        # parsed structured result whose human_readable_review contains real
+        # newline characters (exactly what json.loads() / --json-schema's
+        # structured_output produce for a well-formed response) must reach
+        # the review file on disk with those same real newlines -- not the
+        # literal two-character sequence backslash-n.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            structured = valid_structured_result(local_date="2026-07-20")
+            structured["human_readable_review"] = (
+                "# Daily Review — 2026-07-20\n\n## Today's Recommendation\n\nProceed as planned.\n"
+            )
+
+            with mock.patch.object(wr, "invoke_claude", return_value=self._fake_completed_process(structured)):
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            review_file = repo / result["review_file"]
+            content = review_file.read_text(encoding="utf-8")
+            self.assertGreater(content.count("\n"), 3)
+            self.assertNotIn("\\n", content)
 
     def test_malformed_first_attempt_retries_and_succeeds(self):
         with tempfile.TemporaryDirectory() as td:

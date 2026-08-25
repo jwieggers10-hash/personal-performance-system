@@ -326,7 +326,9 @@ Field notes:
 - "review_file" is your proposed relative path, e.g. "reviews/daily/{local_date.isoformat()}.md" --
   you do not write this file yourself.
 - "human_readable_review" is the complete markdown review text following the Human-Readable Output
-  structure defined in the workflow definition, as a single string (use \\n for line breaks).
+  structure defined in the workflow definition, as a single string containing ordinary multi-line
+  text with real, actual line breaks between lines -- never the literal two-character sequence
+  backslash-n in place of a line break.
 
 If a responsible recommendation cannot be made because essential information is missing, set
 "status" to "completed_with_limitations" or use recommendation_category "more_information_needed"
