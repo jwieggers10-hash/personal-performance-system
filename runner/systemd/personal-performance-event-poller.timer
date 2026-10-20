@@ -1,0 +1,18 @@
+[Unit]
+Description=15-minute trigger for the Personal Performance AthleteData event poller (detect-only)
+
+[Timer]
+# Minutes 02/17/32/47 keep every tick off the 07:00:00 Europe/Amsterdam Daily
+# Review trigger (and off :00/:15/:30/:45 generally). Minute-based, so it is
+# unaffected by the server running UTC or by DST.
+OnCalendar=*-*-* *:02,17,32,47:00
+AccuracySec=30s
+
+# Missed ticks (reboot, outage) are not replayed: the next tick re-reads the
+# rolling windows and the Hevy cursor overlap covers the gap.
+Persistent=false
+
+Unit=personal-performance-event-poller.service
+
+[Install]
+WantedBy=timers.target

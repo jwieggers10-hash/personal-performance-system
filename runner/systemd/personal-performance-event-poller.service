@@ -1,0 +1,37 @@
+[Unit]
+Description=Personal Performance System - AthleteData event poller (detect-only, one-shot)
+Documentation=file:///home/coach/personal-performance-system/runner/event-poller.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=coach
+Group=coach
+WorkingDirectory=/home/coach/personal-performance-system
+
+# Deliberately no EnvironmentFile: runner/config.env also holds the Telegram
+# token, which the poller never needs. The poller reads only
+# ATHLETE_TIMEZONE (and optional EVENT_POLLER_LOG_FILE) from that file
+# itself. The AthleteData MCP endpoint is read at runtime from coach's own
+# Claude Code registration (~/.claude.json) and never copied anywhere.
+ExecStart=/usr/bin/python3 runner/event_poller.py --once
+
+# Detect-only: no Claude invocation, no Telegram delivery. A failed poll is
+# simply retried by the next timer tick, so no automatic restart.
+Restart=no
+# Worst case is three sources x three bounded HTTP attempts plus backoff,
+# well under this cap.
+TimeoutStartSec=300
+
+# Separate lock (runtime/locks/event-poller.lock) and separate state from
+# the Daily Review; the two never block each other.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/coach/personal-performance-system/runtime
+
+SyslogIdentifier=event-poller
+
+# No [Install] section: started only by personal-performance-event-poller.timer.
