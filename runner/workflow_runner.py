@@ -97,12 +97,31 @@ DEFAULT_ALLOWED_TOOLS = "Read,mcp__athletedata__*"
 # See build_retry_prompt() and the retry loop in run_workflow().
 MAX_CLAUDE_ATTEMPTS = 2
 
-# Redact anything that looks like a secret-bearing query param or bearer token
-# before it can reach a log line or an error field. Belt-and-suspenders on top
-# of never passing secrets into strings we log in the first place.
+# Redact anything that looks like a secret before it can reach a log line or
+# an error field. Belt-and-suspenders on top of never passing secrets into
+# strings we log in the first place. Order matters: whole URL query strings
+# (where the AthleteData MCP key lives) and full Authorization header values
+# are removed first, so the narrower patterns below only see what remains.
 _SECRET_PATTERNS = (
-    re.compile(r"(apiKey|api_key|token|secret)=([^&\s]+)", re.IGNORECASE),
+    # Any URL's entire query string -- not just known parameter names.
+    re.compile(r"(https?://[^\s?#\"'<>]+\?)[^\s#\"'<>]+", re.IGNORECASE),
+    # Authorization / X-Api-Key header values, with or without a scheme.
+    re.compile(
+        r"(\b(?:authorization|proxy-authorization|x-api-key)[\"']?\s*[:=]\s*[\"']?)"
+        r"(?:(?:bearer|basic|token)\s+)?[^\s\"',;}]+",
+        re.IGNORECASE,
+    ),
+    # JSON-style credential fields: "api_key": "...", "accessToken": "...", etc.
+    re.compile(
+        r"(\"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|"
+        r"client[_-]?secret|password|bot[_-]?token|oauth[_-]?token)\"\s*:\s*\")[^\"]*",
+        re.IGNORECASE,
+    ),
+    # key=value pairs outside a URL (e.g. env-file or CLI echoes).
+    re.compile(r"(apiKey|api_key|token|secret|password)=([^&\s]+)", re.IGNORECASE),
     re.compile(r"(Bearer\s+)[A-Za-z0-9\-_\.]+", re.IGNORECASE),
+    # Anthropic API / OAuth keys (sk-ant-...) and similar sk_/sk- prefixed keys.
+    re.compile(r"\b(sk[-_])[A-Za-z0-9_\-]{8,}"),
 )
 
 
@@ -574,6 +593,117 @@ def parse_claude_output(raw_stdout: str) -> dict:
     return candidate
 
 
+# --------------------------------------------------------------------------
+# Nonzero-exit diagnosis
+# --------------------------------------------------------------------------
+
+# With --output-format json the Claude CLI reports failures (e.g. "Not logged
+# in · Please run /login", "Invalid API key") as a JSON result object on
+# stdout and exits 1 with an empty stderr -- so stderr alone carries no
+# diagnosis. Only these fixed-vocabulary metadata fields of that object are
+# ever logged. Free text ("result") is read solely to match the fixed signals
+# below and is never logged or forwarded, since on other failure modes it
+# could carry coaching content. Note "subtype" can read "success" even when
+# is_error is true, so it is recorded but never used for classification.
+_CLI_DIAGNOSTIC_FIELDS = (
+    "type", "subtype", "terminal_reason", "is_error", "api_error_status", "api_error_origin", "num_turns",
+)
+_SAFE_DIAGNOSTIC_TOKEN = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+
+# (error_category, signal, pattern) -- first match wins, so more specific
+# signals come first within each category, and auth precedes quota.
+_CLAUDE_FAILURE_SIGNALS = (
+    ("claude_auth_failure", "oauth_token_expired",
+     re.compile(r"oauth token (?:has )?expired|token (?:has )?expired|token.{0,20}revoked", re.IGNORECASE)),
+    ("claude_auth_failure", "invalid_api_key", re.compile(r"invalid (?:x-)?api[ -]key", re.IGNORECASE)),
+    ("claude_auth_failure", "not_logged_in", re.compile(r"not logged in|/login\b", re.IGNORECASE)),
+    ("claude_auth_failure", "authentication_failed",
+     re.compile(r"failed to authenticate|authentication[_ ]error|unauthori[sz]ed", re.IGNORECASE)),
+    ("claude_quota_failure", "usage_limit_reached",
+     re.compile(r"usage limit|hit your limit|limit reached|limit will reset", re.IGNORECASE)),
+    ("claude_quota_failure", "credit_balance_too_low", re.compile(r"credit balance", re.IGNORECASE)),
+    ("claude_quota_failure", "rate_limited", re.compile(r"rate[_ ]limit", re.IGNORECASE)),
+    ("claude_quota_failure", "max_budget_exceeded", re.compile(r"max(?:imum)?[_ ]budget", re.IGNORECASE)),
+)
+_CLAUDE_FAILURE_STATUS_SIGNALS = {
+    401: ("claude_auth_failure", "http_401"),
+    403: ("claude_auth_failure", "http_403"),
+    429: ("claude_quota_failure", "http_429"),
+}
+
+# Fixed, athlete-safe guidance per category. This text (not CLI output) is
+# what reaches result["error"] and therefore the Telegram failure message.
+_CLAUDE_FAILURE_GUIDANCE = {
+    "claude_auth_failure": "Claude Code authentication failed or expired; "
+                           "re-authenticate the coach account on the server.",
+    "claude_quota_failure": "Claude usage, rate, or budget limit reached; rerun once the limit resets.",
+    "claude_execution_failure": "Claude Code execution failed; see the runner log for diagnostics.",
+}
+
+
+@dataclass(frozen=True)
+class ClaudeFailureDiagnosis:
+    error_category: str
+    signal: Optional[str]
+    stdout_format: str  # "json", "non_json", or "empty"
+    cli_fields: dict = field(default_factory=dict)  # allowlisted, validated values only
+
+
+def diagnose_claude_failure(stdout: Optional[str], stderr: Optional[str]) -> ClaudeFailureDiagnosis:
+    stdout = stdout or ""
+    stderr = stderr or ""
+    cli_fields: dict = {}
+    texts = [stderr]
+
+    if not stdout.strip():
+        stdout_format = "empty"
+    else:
+        try:
+            outer = json.loads(stdout)
+        except json.JSONDecodeError:
+            outer = None
+        if isinstance(outer, dict):
+            stdout_format = "json"
+            for name in _CLI_DIAGNOSTIC_FIELDS:
+                value = outer.get(name)
+                if isinstance(value, bool):
+                    cli_fields[name] = value
+                elif isinstance(value, int) and 0 <= value < 100000:
+                    cli_fields[name] = value
+                elif isinstance(value, str) and _SAFE_DIAGNOSTIC_TOKEN.match(value):
+                    cli_fields[name] = value
+            for name in ("result", "error", "terminal_reason"):
+                if isinstance(outer.get(name), str):
+                    texts.append(outer[name])
+        else:
+            stdout_format = "non_json"
+            texts.append(stdout[-2000:])
+
+    combined = "\n".join(texts)
+    for category, signal, pattern in _CLAUDE_FAILURE_SIGNALS:
+        if pattern.search(combined):
+            return ClaudeFailureDiagnosis(category, signal, stdout_format, cli_fields)
+
+    status = cli_fields.get("api_error_status")
+    if not isinstance(status, bool) and status in _CLAUDE_FAILURE_STATUS_SIGNALS:
+        category, signal = _CLAUDE_FAILURE_STATUS_SIGNALS[status]
+        return ClaudeFailureDiagnosis(category, signal, stdout_format, cli_fields)
+
+    return ClaudeFailureDiagnosis("claude_execution_failure", None, stdout_format, cli_fields)
+
+
+def describe_claude_failure(returncode: int, diagnosis: ClaudeFailureDiagnosis, stderr: Optional[str]) -> str:
+    """Builds result["error"] for a nonzero exit: fixed category text plus
+    the (redacted, truncated) stderr excerpt the runner has always included.
+    Never includes stdout, which may carry coaching content."""
+    label = diagnosis.error_category + (f": {diagnosis.signal}" if diagnosis.signal else "")
+    message = f"Claude exited with status {returncode} ({label}). {_CLAUDE_FAILURE_GUIDANCE[diagnosis.error_category]}"
+    stderr_excerpt = (stderr or "").strip()[:500]
+    if stderr_excerpt:
+        message += f" stderr: {stderr_excerpt}"
+    return redact_secrets(message)
+
+
 def validate_structured_result(
     result: dict,
     expected_workflow: str,
@@ -756,6 +886,24 @@ def run_workflow(
         return result
 
     try:
+        # Automated runs never overwrite a completed review, so if today's
+        # canonical review already exists (e.g. a Persistent=true catch-up or
+        # a manual `systemctl start` after the 07:00 run), skip before spending
+        # a Claude invocation. Checked under the lock so a concurrent run
+        # can't slip in between. Manual mode is unchanged: it still runs and
+        # writes a distinct .manual-* file. The write-time DuplicateReviewError
+        # guard below stays as the backstop.
+        if execution_mode == "automated" and canonical_review_path is not None \
+                and canonical_review_path.exists():
+            result["status"] = "duplicate_skipped"
+            result["notification_required"] = False
+            result["notification_level"] = "routine"
+            result["error"] = f"Completed review already exists: {canonical_review_path}"
+            log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
+                      status="duplicate_skipped", error_category="review_already_exists",
+                      skipped_stage="before_claude")
+            return result
+
         governing_documents = parse_governing_documents(workflow_file)
         prompt = build_prompt(
             workflow_name=workflow_name,
@@ -799,11 +947,13 @@ def run_workflow(
                 return result
 
             if completed.returncode != 0:
-                result["error"] = redact_secrets(
-                    f"Claude exited with status {completed.returncode}: {completed.stderr.strip()[:500]}"
-                )
+                diagnosis = diagnose_claude_failure(completed.stdout, completed.stderr)
+                result["error"] = describe_claude_failure(completed.returncode, diagnosis, completed.stderr)
                 log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                          status="failed", error_category="claude_execution_failure", attempt=attempt)
+                          status="failed", error_category=diagnosis.error_category,
+                          failure_signal=diagnosis.signal, exit_code=completed.returncode,
+                          stdout_format=diagnosis.stdout_format, stdout_bytes=len(completed.stdout or ""),
+                          stderr_bytes=len(completed.stderr or ""), cli=diagnosis.cli_fields, attempt=attempt)
                 return result
 
             try:
@@ -846,7 +996,8 @@ def run_workflow(
                 result["notification_level"] = "routine"
                 result["error"] = str(exc)
                 log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,
-                          status="duplicate_skipped", error_category="review_already_exists")
+                          status="duplicate_skipped", error_category="review_already_exists",
+                          skipped_stage="at_write")
                 return result
             except OSError as exc:
                 result["error"] = f"failed to write review file: {redact_secrets(str(exc))}"

@@ -424,6 +424,149 @@ class RedactSecretsTests(unittest.TestCase):
         text = "Garmin resting heart rate is 44 bpm"
         self.assertEqual(wr.redact_secrets(text), text)
 
+    # All credentials below are synthetic test values.
+
+    def test_redacts_anthropic_api_key(self):
+        text = "ANTHROPIC key sk-ant-api03-SYNTHETICtestKEY_0123456789-abcdef in use"
+        redacted = wr.redact_secrets(text)
+        self.assertNotIn("SYNTHETICtestKEY_0123456789", redacted)
+        self.assertIn("in use", redacted)
+
+    def test_redacts_authorization_header_with_and_without_scheme(self):
+        for text in ("Authorization: Bearer synthetic.jwt.value",
+                     "authorization=Basic c3ludGhldGljOnVzZXI=",
+                     "Authorization: rawSyntheticToken123",
+                     '{"Authorization": "Bearer synthetic.jwt.value"}'):
+            redacted = wr.redact_secrets(text)
+            for secret in ("synthetic.jwt.value", "c3ludGhldGljOnVzZXI=", "rawSyntheticToken123"):
+                self.assertNotIn(secret, redacted, text)
+
+    def test_redacts_x_api_key_header(self):
+        redacted = wr.redact_secrets("x-api-key: syntheticHeaderKey987")
+        self.assertNotIn("syntheticHeaderKey987", redacted)
+
+    def test_redacts_json_style_credential_fields(self):
+        text = json.dumps({
+            "accessToken": "synthAccess111",
+            "refresh_token": "synthRefresh222",
+            "api_key": "synthApiKey333",
+            "client_secret": "synthClient444",
+            "password": "synthPassword555",
+            "note": "keep me",
+        })
+        redacted = wr.redact_secrets(text)
+        for secret in ("synthAccess111", "synthRefresh222", "synthApiKey333", "synthClient444", "synthPassword555"):
+            self.assertNotIn(secret, redacted)
+        self.assertIn("keep me", redacted)
+
+    def test_redacts_entire_url_query_string_for_any_parameter_name(self):
+        text = "connect failed: https://mcp.example.test/mcp?session=abc&k=syntheticUnknownParam9 (timeout)"
+        redacted = wr.redact_secrets(text)
+        self.assertNotIn("syntheticUnknownParam9", redacted)
+        self.assertNotIn("session=abc", redacted)
+        self.assertIn("https://mcp.example.test/mcp?", redacted)
+        self.assertIn("(timeout)", redacted)
+
+    def test_leaves_url_without_query_and_iso_timestamps_untouched(self):
+        text = "see https://example.test/docs/page at 2026-10-20T05:00:01+00:00"
+        self.assertEqual(wr.redact_secrets(text), text)
+
+
+# Trimmed from real `claude --print --output-format json` output captured with
+# no credentials / a synthetic invalid API key (exit status 1, empty stderr).
+CLI_NOT_LOGGED_IN_STDOUT = json.dumps({
+    "type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+    "api_error_status": None, "num_turns": 1, "result": "Not logged in · Please run /login",
+    "session_id": "c56cdef1-6a2a-42fb-95be-5b77cc40a86a",
+})
+CLI_INVALID_API_KEY_STDOUT = json.dumps({
+    "type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+    "api_error_status": 401, "api_error_origin": "first_party", "num_turns": 1,
+    "result": "Invalid API key · Fix external API key",
+    "session_id": "a00c4f0b-308b-4808-9870-73a534b0ea7a",
+})
+
+
+def cli_error_stdout(result_text: str, api_error_status=None, **extra) -> str:
+    payload = {"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+               "api_error_status": api_error_status, "num_turns": 1, "result": result_text}
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+class DiagnoseClaudeFailureTests(unittest.TestCase):
+    def test_not_logged_in_is_auth_failure(self):
+        d = wr.diagnose_claude_failure(CLI_NOT_LOGGED_IN_STDOUT, "")
+        self.assertEqual((d.error_category, d.signal, d.stdout_format),
+                         ("claude_auth_failure", "not_logged_in", "json"))
+
+    def test_invalid_api_key_is_auth_failure(self):
+        d = wr.diagnose_claude_failure(CLI_INVALID_API_KEY_STDOUT, "")
+        self.assertEqual((d.error_category, d.signal), ("claude_auth_failure", "invalid_api_key"))
+        self.assertEqual(d.cli_fields["api_error_status"], 401)
+
+    def test_expired_oauth_token_is_auth_failure(self):
+        d = wr.diagnose_claude_failure(
+            cli_error_stdout("OAuth token has expired. Please obtain a new token or refresh your existing token.",
+                             401), "")
+        self.assertEqual((d.error_category, d.signal), ("claude_auth_failure", "oauth_token_expired"))
+
+    def test_status_401_with_unrecognized_text_is_auth_failure(self):
+        d = wr.diagnose_claude_failure(cli_error_stdout("Something unexpected happened", 401), "")
+        self.assertEqual((d.error_category, d.signal), ("claude_auth_failure", "http_401"))
+
+    def test_usage_limit_is_quota_failure(self):
+        d = wr.diagnose_claude_failure(cli_error_stdout("Claude AI usage limit reached|1760000000"), "")
+        self.assertEqual((d.error_category, d.signal), ("claude_quota_failure", "usage_limit_reached"))
+
+    def test_credit_balance_is_quota_failure(self):
+        d = wr.diagnose_claude_failure(cli_error_stdout("Credit balance is too low"), "")
+        self.assertEqual((d.error_category, d.signal), ("claude_quota_failure", "credit_balance_too_low"))
+
+    def test_status_429_is_quota_failure(self):
+        d = wr.diagnose_claude_failure(cli_error_stdout("Request failed", 429), "")
+        self.assertEqual((d.error_category, d.signal), ("claude_quota_failure", "http_429"))
+
+    def test_auth_signal_in_stderr_is_recognized(self):
+        d = wr.diagnose_claude_failure("", "Error: Failed to authenticate. API Error: 401")
+        self.assertEqual(d.error_category, "claude_auth_failure")
+        self.assertEqual(d.stdout_format, "empty")
+
+    def test_unrecognized_failure_is_generic_execution_failure(self):
+        d = wr.diagnose_claude_failure(cli_error_stdout("Tool execution crashed", 500), "")
+        self.assertEqual((d.error_category, d.signal), ("claude_execution_failure", None))
+
+    def test_non_json_stdout_is_classified_without_parsing(self):
+        d = wr.diagnose_claude_failure("panic: Not logged in · Please run /login\n", "")
+        self.assertEqual((d.error_category, d.stdout_format), ("claude_auth_failure", "non_json"))
+        self.assertEqual(d.cli_fields, {})
+
+    def test_cli_fields_are_allowlisted_and_never_include_free_text(self):
+        stdout = cli_error_stdout("Coaching text: Sleep 6h, HRV low, skip intervals",
+                                  terminal_reason="api error with spaces and Bearer synthetic.tok")
+        d = wr.diagnose_claude_failure(stdout, "")
+        self.assertNotIn("result", d.cli_fields)
+        self.assertNotIn("session_id", d.cli_fields)
+        # A non-token string value is dropped rather than logged.
+        self.assertNotIn("terminal_reason", d.cli_fields)
+        self.assertTrue(set(d.cli_fields) <= set(wr._CLI_DIAGNOSTIC_FIELDS))
+        self.assertNotIn("HRV", json.dumps(d.cli_fields))
+
+    def test_describe_uses_fixed_guidance_and_never_includes_stdout(self):
+        stdout = cli_error_stdout("Not logged in · Please run /login. Coaching: HRV low today")
+        d = wr.diagnose_claude_failure(stdout, "")
+        message = wr.describe_claude_failure(1, d, "")
+        self.assertIn("claude_auth_failure: not_logged_in", message)
+        self.assertIn("re-authenticate", message)
+        self.assertNotIn("HRV", message)
+        self.assertNotIn("stderr:", message)
+
+    def test_describe_keeps_redacted_stderr_excerpt(self):
+        d = wr.diagnose_claude_failure("", "boom apiKey=sk_soma_synthetic123456")
+        message = wr.describe_claude_failure(2, d, "boom apiKey=sk_soma_synthetic123456")
+        self.assertIn("stderr: boom", message)
+        self.assertNotIn("sk_soma_synthetic123456", message)
+
 
 class RunWorkflowTests(unittest.TestCase):
     def _fake_completed_process(self, structured: dict, returncode: int = 0):
@@ -657,6 +800,166 @@ class RunWorkflowTests(unittest.TestCase):
             # A nonzero CLI exit is a distinct failure mode from malformed
             # output and must never trigger the retry.
             self.assertEqual(mocked_invoke.call_count, 1)
+
+    def _capture_log_events(self):
+        events = []
+        return events, mock.patch.object(wr, "log_event", side_effect=lambda config, **f: events.append(f))
+
+    def test_claude_auth_failure_is_classified_logged_and_notified_safely(self):
+        # Reproduces the Sep 21 - Oct 19 production failure shape: exit 1,
+        # empty stderr, diagnosis only in the JSON stdout.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            failing = mock.Mock(returncode=1, stdout=CLI_NOT_LOGGED_IN_STDOUT, stderr="")
+            fake_delivery = {"notification_delivered": True, "notification_delivery_error": None,
+                             "notification_skipped": False, "parts_sent": 1}
+            events, log_patch = self._capture_log_events()
+
+            with mock.patch.object(wr, "invoke_claude", return_value=failing) as mocked_invoke, \
+                 mock.patch.object(wr.telegram_delivery, "deliver_review", return_value=fake_delivery) as notify, \
+                 log_patch:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(mocked_invoke.call_count, 1)  # nonzero exit is still never retried
+            self.assertIn("claude_auth_failure: not_logged_in", result["error"])
+            self.assertNotIn("session_id", result["error"])
+            # Existing urgent failure notification is preserved.
+            self.assertEqual(notify.call_count, 1)
+            self.assertEqual(result["notification_level"], "urgent")
+            self.assertTrue(result["notification_required"])
+
+            end = [e for e in events if e.get("event") == "workflow_end"][-1]
+            self.assertEqual(end["error_category"], "claude_auth_failure")
+            self.assertEqual(end["failure_signal"], "not_logged_in")
+            self.assertEqual(end["exit_code"], 1)
+            self.assertEqual(end["stdout_format"], "json")
+            self.assertEqual(end["stderr_bytes"], 0)
+            self.assertEqual(end["cli"]["terminal_reason"], "api_error")
+            self.assertTrue(end["cli"]["is_error"])
+            logged = json.dumps(events)
+            self.assertNotIn("Please run /login", logged)
+            self.assertNotIn("c56cdef1-6a2a-42fb-95be-5b77cc40a86a", logged)
+
+    def test_claude_failure_log_never_contains_stdout_coaching_content_or_secrets(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            stdout = cli_error_stdout(
+                "Coaching: RHR 44, weight trend down. Tool error at "
+                "https://mcp.example.test/mcp?apiKey=sk_soma_syntheticLEAK1 Bearer synthetic.jwt.LEAK2",
+                500,
+            )
+            failing = mock.Mock(returncode=1, stdout=stdout,
+                                stderr="fatal: x-api-key: syntheticLEAK3 sk-ant-api03-syntheticLEAK4xxxxx")
+            events, log_patch = self._capture_log_events()
+
+            with mock.patch.object(wr, "invoke_claude", return_value=failing), log_patch:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            surfaced = json.dumps(events) + result["error"]
+            for leaked in ("RHR 44", "weight trend", "syntheticLEAK1", "LEAK2", "syntheticLEAK3",
+                           "syntheticLEAK4", "mcp.example.test"):
+                self.assertNotIn(leaked, surfaced)
+            self.assertIn("claude_execution_failure", result["error"])
+
+    def test_automated_run_skips_claude_when_review_already_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo, telegram_bot_token="123:synthetic", telegram_chat_id="1")
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            existing = repo / "reviews" / "daily" / "2026-07-20.md"
+            existing.parent.mkdir(parents=True)
+            existing.write_text("already here", encoding="utf-8")
+            events, log_patch = self._capture_log_events()
+
+            with mock.patch.object(wr, "invoke_claude") as mocked_invoke, \
+                 mock.patch.object(wr.telegram_delivery, "_default_http_post") as http_post, \
+                 log_patch:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            mocked_invoke.assert_not_called()
+            http_post.assert_not_called()  # no Telegram message for a duplicate skip
+            self.assertEqual(result["status"], "duplicate_skipped")
+            self.assertFalse(result["notification_required"])
+            self.assertIn("already exists", result["error"])
+            self.assertEqual(existing.read_text(encoding="utf-8"), "already here")
+            self.assertFalse((repo / "runtime" / "locks" / "daily-review-2026-07-20.lock").exists())
+            end = [e for e in events if e.get("event") == "workflow_end"][-1]
+            self.assertEqual(end["error_category"], "review_already_exists")
+            self.assertEqual(end["skipped_stage"], "before_claude")
+            self.assertFalse(any(e.get("event") == "claude_invoke_start" for e in events))
+
+    def test_manual_run_still_invokes_claude_when_review_already_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            existing = repo / "reviews" / "daily" / "2026-07-20.md"
+            existing.parent.mkdir(parents=True)
+            existing.write_text("already here", encoding="utf-8")
+            structured = valid_structured_result(mode="manual", local_date="2026-07-20")
+
+            with mock.patch.object(wr, "invoke_claude",
+                                   return_value=self._fake_completed_process(structured)) as mocked_invoke:
+                result = wr.run_workflow("daily-review", "manual", config, now=fixed_now)
+
+            self.assertEqual(mocked_invoke.call_count, 1)
+            self.assertEqual(result["status"], "completed")
+            self.assertIn(".manual-", result["review_file"])
+            self.assertEqual(existing.read_text(encoding="utf-8"), "already here")
+
+    def test_write_time_guard_still_catches_review_created_during_claude_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo)
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            existing = repo / "reviews" / "daily" / "2026-07-20.md"
+            structured = valid_structured_result(local_date="2026-07-20")
+            completed = self._fake_completed_process(structured)
+
+            def review_appears_mid_run(*_args, **_kwargs):
+                existing.parent.mkdir(parents=True, exist_ok=True)
+                existing.write_text("written by another process", encoding="utf-8")
+                return completed
+
+            events, log_patch = self._capture_log_events()
+            with mock.patch.object(wr, "invoke_claude", side_effect=review_appears_mid_run) as mocked_invoke, \
+                 log_patch:
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(mocked_invoke.call_count, 1)
+            self.assertEqual(result["status"], "duplicate_skipped")
+            self.assertEqual(existing.read_text(encoding="utf-8"), "written by another process")
+            end = [e for e in events if e.get("event") == "workflow_end"][-1]
+            self.assertEqual(end["skipped_stage"], "at_write")
+
+    def test_failure_message_reaches_telegram_formatter_without_stdout_content(self):
+        # End-to-end through the real deliver_review/build_message path, with
+        # only the HTTP transport stubbed -- confirms Telegram compatibility.
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(Path(td))
+            config = make_config(repo, telegram_bot_token="123:synthetic", telegram_chat_id="1")
+            fixed_now = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+            failing = mock.Mock(returncode=1, stdout=CLI_INVALID_API_KEY_STDOUT, stderr="")
+            sent = []
+
+            def fake_post(url, data, timeout=10.0):
+                sent.append(data["text"])
+                return 200, json.dumps({"ok": True})
+
+            with mock.patch.object(wr, "invoke_claude", return_value=failing), \
+                 mock.patch.object(wr.telegram_delivery, "_default_http_post", side_effect=fake_post):
+                result = wr.run_workflow("daily-review", "automated", config, now=fixed_now)
+
+            self.assertEqual(len(sent), 1)
+            self.assertTrue(result["notification_delivered"])
+            self.assertIn("Review could not be completed", sent[0])
+            self.assertIn("claude_auth_failure: invalid_api_key", sent[0])
+            self.assertNotIn("Fix external API key", sent[0])
 
     def test_unknown_workflow_reports_failed(self):
         with tempfile.TemporaryDirectory() as td:

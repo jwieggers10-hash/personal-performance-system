@@ -122,14 +122,38 @@ The runner produces operational logs — records of what the runner itself did (
 
 The runner must account for:
 
-- **Claude failure** — the invocation itself fails or errors out. Recorded as a failed execution; no review file is written or overwritten.
+- **Claude failure** — the invocation itself fails or errors out. Recorded as a failed execution; no review file is written or overwritten. A nonzero CLI exit is classified (see Claude CLI Failure Diagnostics below) and is never retried.
 - **AthleteData failure** — one or more integrations are unavailable. This is not automatically a runner-level failure; the workflow definition decides whether the result is `completed_with_limitations` or something more severe. The runner's job is to make sure that decision is possible, not to make it.
 - **Malformed output** — Claude returns output that doesn't match the Structured Result Contract. The runner allows at most one bounded, explicitly-corrective retry (see Structured-Output Enforcement and Retry above) before treating it as a failed execution; malformed output is never passed through and trusted, on either attempt.
 - **Storage failure** — the review file cannot be written. Never reported as a successful completion.
 - **Timeout** — the execution exceeds its allotted time. Terminated, recorded as a failed or timed-out execution, and the lock is released rather than left held.
-- **Duplicate execution** — a second execution for the same workflow-run is attempted while one is already in progress or already completed. Detected via the lock (in-progress case) or via the idempotency rule the workflow defines (already-completed case), and reported as `duplicate_skipped` rather than run again.
+- **Duplicate execution** — a second execution for the same workflow-run is attempted while one is already in progress or already completed. Detected via the lock (in-progress case) or via the idempotency rule the workflow defines (already-completed case), and reported as `duplicate_skipped` rather than run again. In automated mode the already-completed check happens twice:
+  - **Before Claude** — immediately after the lock is acquired, if the workflow's canonical review file already exists, the run ends as `duplicate_skipped` (`error_category=review_already_exists`, `skipped_stage=before_claude`) without invoking Claude. No notification is required, so nothing is sent.
+  - **At write** — the existing write-time guard remains as a backstop for a review that appears while Claude is running (`skipped_stage=at_write`).
+
+  Manual mode is unchanged: it always invokes Claude and, if a canonical review exists, writes a distinct `.manual-<time>` file alongside it.
 
 A failed or timed-out execution does not retry indefinitely on its own; retrying is a decision made outside the single execution (by a human, or later by a scheduler's own policy), not something the runner does automatically and silently.
+
+### Claude CLI Failure Diagnostics
+
+With `--output-format json`, the Claude CLI reports failures such as "Not logged in" or "Invalid API key" as a JSON result object on stdout, exiting 1 with an empty stderr (observed in production, 2026-09-21 to 2026-10-19). On a nonzero exit the runner therefore inspects stdout as well as stderr, and classifies the failure:
+
+| `error_category` | Meaning | Example `failure_signal` values |
+|---|---|---|
+| `claude_auth_failure` | Not logged in, invalid/expired credentials | `oauth_token_expired`, `invalid_api_key`, `not_logged_in`, `authentication_failed`, `http_401`, `http_403` |
+| `claude_quota_failure` | Usage, rate, credit, or budget limit | `usage_limit_reached`, `credit_balance_too_low`, `rate_limited`, `max_budget_exceeded`, `http_429` |
+| `claude_execution_failure` | Any other nonzero exit | — |
+
+Timeouts keep their own `timeout` category. Classification never changes the outcome: the run is `failed`, not retried, and sends the existing urgent failure notification.
+
+Security rules for these diagnostics:
+
+- Only an explicit allowlist of fixed-vocabulary CLI fields is logged (`type`, `subtype`, `terminal_reason`, `is_error`, `api_error_status`, `api_error_origin`, `num_turns`), and string values must be short simple tokens; anything else is dropped. `subtype` is recorded but never used for classification — it can read `success` on a failed run.
+- Free text from stdout (the CLI's `result`) is used only to match the fixed signals and is never logged or forwarded, since on other failure modes it could carry coaching content.
+- The `error` field (also the Telegram failure text) is built from fixed per-category guidance plus the redacted, truncated stderr excerpt — never from stdout.
+- The log event adds `failure_signal`, `exit_code`, `stdout_format`, `stdout_bytes`, `stderr_bytes`, and the allowlisted `cli` fields.
+- All logged and error strings pass through `redact_secrets()`, which removes entire URL query strings, `Authorization`/`X-Api-Key` header values, JSON-style credential fields, `key=value` secrets, bearer tokens, and `sk-`/`sk-ant-` keys.
 
 ---
 
