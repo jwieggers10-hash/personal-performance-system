@@ -10,12 +10,14 @@ User=coach
 Group=coach
 WorkingDirectory=/home/coach/personal-performance-system
 
-# Deliberately no EnvironmentFile: runner/config.env also holds the Telegram
-# token, which the poller never needs. The poller reads only
-# ATHLETE_TIMEZONE (and optional EVENT_POLLER_LOG_FILE) from that file
-# itself. The AthleteData MCP endpoint is read at runtime from coach's own
-# Claude Code registration (~/.claude.json) and never copied anywhere.
-ExecStart=/usr/bin/python3 runner/event_poller.py --once
+# Deliberately no EnvironmentFile, and --env-file /dev/null so the poller
+# never reads runner/config.env (it also holds the Telegram token). The only
+# setting it needs is supplied here; an optional EVENT_POLLER_LOG_FILE would
+# also have to be set here, pointing inside runtime/. The AthleteData MCP
+# endpoint is read at runtime from coach's own Claude Code registration
+# (~/.claude.json, read-only via ProtectHome) and never copied anywhere.
+Environment=ATHLETE_TIMEZONE=Europe/Amsterdam
+ExecStart=/usr/bin/python3 runner/event_poller.py --once --env-file /dev/null
 
 # Detect-only: no Claude invocation, no Telegram delivery. A failed poll is
 # simply retried by the next timer tick, so no automatic restart.
@@ -31,6 +33,12 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/coach/personal-performance-system/runtime
+# Secrets the poller never needs. The whole ~/.claude directory (not just
+# .credentials.json) so a token refresh that atomically replaces the file
+# cannot expose it mid-run; the poller needs nothing in it. "-": a missing
+# path is not an error.
+InaccessiblePaths=-/home/coach/personal-performance-system/runner/config.env
+InaccessiblePaths=-/home/coach/.claude
 
 SyslogIdentifier=event-poller
 
