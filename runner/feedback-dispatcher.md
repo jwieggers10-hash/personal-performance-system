@@ -107,7 +107,8 @@ All decisions use Europe/Amsterdam wall time via `zoneinfo`, so they follow DST 
 - Auth failure and missing CLI are systemic: the batch is requeued **without** spending an attempt and no further Claude call is made that run. 3 consecutive auth failures → `urgent` alert (once per day) and a 6 h circuit breaker. Any answered call resets the counter.
 - Other failures: up to 3 generation attempts per batch, backoff 15 min then 60 min, then `failed`.
 - Daily budget `FEEDBACK_DAILY_CLAUDE_BUDGET` (default 6 invocations per local day, retries included, recorded in `claude_calls`). When exhausted, batches wait (and may expire) and one attention alert is queued.
-- Set `CLAUDE_AUTH_EXPIRES_ON=2026-11-16` (the known refresh-token expiry) before go-live: an alert from 2026-11-09, and calls stop after the date instead of failing repeatedly.
+- `CLAUDE_AUTH_EXPIRES_ON` is a `YYYY-MM-DD` date: the **last allowed local calendar date in Europe/Amsterdam** (compared with the athlete-local date, not UTC). Claude calls are allowed through that whole local day and stop from the next local day (`auth_expired_by_date`); an attention alert is queued from 7 local days before (`expires_on − today ≤ 7`). It is a monitoring date only: it never reads, renews or validates credentials, and the CLI's real token expiry may fall earlier or later than the configured day.
+- Production value (set 2026-10-22): `2026-11-16`, **provisional**. It comes from the Phase 4.2 audit and has not been re-verified since — `claude auth status` does not report an expiry and the credential file is deliberately not read. Alert from 2026-11-09; calls stop from 2026-11-17. If the real expiry is earlier, calls fail first and are classified and escalated as auth failures. Update the date after re-authenticating.
 - `--simulate` does not run `claude auth status` either (`assurance: none_simulation`).
 
 ## Telegram Delivery
@@ -159,13 +160,52 @@ Copies the store read-only into memory, migrates the copy, sets a simulated acti
 
 ---
 
+## Supervised Runs (Approved Plans)
+
+An unattended `--once` processes *everything* that is eligible or due when it starts. For supervised live tests that is not enough: between checking a plan and running it, the poller can detect another session, or the outbox can change. Supervised runs therefore execute an **approved plan** — exactly what was reviewed, or nothing.
+
+**Plan.** Computed read-only by the same code that later executes it (intake planning is separated from applying it). It covers:
+- every candidate event, with its decision and reason (eligible, settling, expired, suppressed), keyed by row id plus the poller's HMAC fingerprint and every eligibility-relevant column (state, feedback status, times, eligibility time, supersession)
+- the planned grouping into batches (members, kind, level, release time, whether a batch is new or joined)
+- every open batch already in the outbox (queued or processing: stage, attempts, next attempt, parts, message hash, members, and the crash-recovery action if its lease has expired)
+- the batches to process now, the batch limit, activation state and the plan's creation time
+
+The canonical JSON form (sorted keys and lists, so row order does not matter) is hashed with SHA-256. The approver sees a token `p1.<unix time>.<sha256>` and aggregates only: counts by source and decision, planned batches with source / activity type / local date / minutes since detection, open-batch count, blockers and expiry. No provider identifier, fingerprint, activity time or measurement is shown.
+
+**Suitable** only when nothing blocks it: `nothing_to_process`, `exceeds_max_batches`, `events_settling` (wait out the 10 min), `new_events_deferred` (e.g. quiet hours: new events would be queued for a later, unapproved run), `batch_in_progress` (another run holds a batch within its lease).
+
+**Execution** (`--once --expect-plan TOKEN --max-batches N`, still requiring `FEEDBACK_DISPATCH_ENABLED=true`):
+1. Reject a malformed token (`plan_invalid`) or one older than 20 min / more than 2 min in the future (`plan_stale`).
+2. `BEGIN IMMEDIATE` — from here the poller and any other dispatcher cannot write.
+3. Reject an already used approval (`plan_already_used`), recompute the plan at the current time and compare (`plan_mismatch`, with the current plan's aggregates), reject blockers (`plan_unsuitable`). Each rejection rolls back: no write, no activation, no Claude, no Telegram, exit code 3.
+4. On a match, in the same transaction: planned crash recovery, first activation, intake exactly as planned, and the single-use record `meta.dispatcher.plan_consumed.<digest>`. Commit.
+5. Process only the approved batches: revalidate → generate → revalidate → deliver, each once. Nothing else in the outbox is generated or delivered in this run, including system alerts raised during it (they stay queued for a later run).
+
+**Guarantees.**
+- A changed eligible set, status, grouping, open outbox, batch limit or creation time changes the digest, so the run aborts rather than processing anything unapproved; at most `--max-batches` batches (1–3) are processed.
+- An approval works at most once (recorded in the committing transaction), so a crash after commit cannot be replayed with the same token; concurrent dispatchers with one token result in exactly one execution.
+- Events that become invalid after the commit (poller supersedes or deletes them) are suppressed by revalidation; other events are never substituted in.
+- Not covered: the digest proves the plan is unchanged, not that it is the session you intended — check the event descriptors before approving. Telegram limitations (at-most-once) still apply.
+
+```bash
+cd /home/coach/personal-performance-system
+/usr/bin/python3 runner/feedback_dispatcher.py --simulate --max-batches 1 2>/dev/null
+#   -> supervised_plan: plan_token, suitable_for_supervised_execution, blockers, planned_new_batches
+FEEDBACK_DISPATCH_ENABLED=true FEEDBACK_DAILY_CLAUDE_BUDGET=2 \
+  /usr/bin/python3 runner/feedback_dispatcher.py --once --expect-plan 'p1.<time>.<sha256>' --max-batches 1
+```
+
+`--simulate --max-batches N` also simulates that supervised run on the in-memory copy; with `--at`, no usable token is printed. `--expect-plan` requires `--once` and `--max-batches`; `--max-batches` is accepted only with `--simulate` or `--once --expect-plan`; `--at`/`--until` only with `--simulate`; `--until` not with `--max-batches`.
+
+---
+
 ## Deployment (requires approval; not done in Phase 4.3)
 
 1. Deploy this code (the poller must run code that accepts v2 **before** the store is migrated; old poller code refuses a v2 store).
 2. `/usr/bin/python3 -m unittest discover -s runner/tests`
 3. `--migrate-check`, then `--migrate`; confirm `--status` and `event_poller.py --status` both report version 2 and the poller's next tick succeeds.
-4. In `runner/config.env`: `CLAUDE_AUTH_EXPIRES_ON=2026-11-16`, `FEEDBACK_DAILY_CLAUDE_BUDGET=6`; leave `FEEDBACK_DISPATCH_ENABLED` unset.
-5. Install the units (no `enable` yet), run `--simulate` again, then set `FEEDBACK_DISPATCH_ENABLED=true` and run one supervised `--once` during the day.
+4. In `runner/config.env`: `CLAUDE_AUTH_EXPIRES_ON` (provisional `2026-11-16`, see above; set 2026-10-22), optionally `FEEDBACK_DAILY_CLAUDE_BUDGET` (default 6); leave `FEEDBACK_DISPATCH_ENABLED` unset.
+5. First live feedback only as a supervised run (see Supervised Runs): after a genuinely new session, `--simulate --max-batches 1`, approval of the plan, then `--once --expect-plan … --max-batches 1` with `FEEDBACK_DISPATCH_ENABLED=true` set for that command only.
 6. `sudo systemctl enable --now personal-performance-feedback-dispatcher.timer`
 
 ```bash

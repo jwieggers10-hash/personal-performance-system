@@ -21,6 +21,8 @@ Usage:
     python3 runner/feedback_dispatcher.py --migrate-check
     python3 runner/feedback_dispatcher.py --migrate          # applies schema v2 (with backup)
     python3 runner/feedback_dispatcher.py --once             # live; requires FEEDBACK_DISPATCH_ENABLED=true
+    python3 runner/feedback_dispatcher.py --simulate --max-batches 1              # prints a plan token
+    python3 runner/feedback_dispatcher.py --once --expect-plan TOKEN --max-batches 1   # supervised run
     python3 runner/feedback_dispatcher.py --requeue-failed-delivery   # only definitive Telegram failures
     python3 runner/feedback_dispatcher.py --downgrade-v1     # rollback; keeps all detections
 """
@@ -28,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -70,6 +73,12 @@ MAX_GENERATIONS_PER_RUN = 3
 # of a duplicate. delivery_outcome_unknown is deliberately absent.
 RETRY_SAFE_DELIVERY_FAILURES = ("telegram_rejected", "telegram_retries_exhausted")
 LOCK_STALE_SECONDS = 3600
+# Approved plans (supervised runs): how long an approval stays valid, and the
+# largest batch limit a supervised run accepts.
+PLAN_VERSION = 1
+PLAN_TTL = timedelta(minutes=20)
+PLAN_CLOCK_SKEW = timedelta(minutes=2)
+MAX_SUPERVISED_BATCHES = MAX_GENERATIONS_PER_RUN
 SIMULATION_STEP = timedelta(minutes=15)
 SIMULATION_MAX_SPAN = timedelta(days=7)
 
@@ -143,6 +152,105 @@ SIMULATED_TELEGRAM = td.TelegramConfig(bot_token="simulated", chat_id="simulated
 # Dispatcher
 # --------------------------------------------------------------------------
 
+@dataclass
+class GroupPlan:
+    events: list
+    level: str
+    level_reasons: list
+    kind: str                       # 'event' or 'morning_digest'
+    batch_key: str
+    existing_batch_id: Optional[int]
+    release_at: str
+    counter: Optional[str]          # intake counter suffix, e.g. 'queued_for_morning'
+    creates_batch: bool
+
+
+@dataclass
+class IntakePlan:
+    decisions: list                 # [(event row, fp.Verdict)]
+    groups: list                    # [GroupPlan]
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def plan_token(created_at: datetime, digest: str) -> str:
+    """What the operator approves: plan version, creation time and digest."""
+    return f"p{PLAN_VERSION}.{int(created_at.timestamp())}.{digest}"
+
+
+def parse_plan_token(token: str) -> "tuple[datetime, str]":
+    parts = (token or "").strip().split(".")
+    if len(parts) != 3 or parts[0] != f"p{PLAN_VERSION}" or not parts[1].isdigit() \
+            or len(parts[2]) != 64 or any(c not in "0123456789abcdef" for c in parts[2]):
+        raise ValueError("malformed plan token")
+    return datetime.fromtimestamp(int(parts[1]), tz=UTC), parts[2]
+
+
+@dataclass
+class Plan:
+    digest: str
+    created_at: datetime
+    max_batches: int
+    intake: IntakePlan
+    processable: list
+    blockers: list
+    candidates: list
+    open_batches: list
+
+    @property
+    def token(self) -> str:
+        return plan_token(self.created_at, self.digest)
+
+    def summary(self, tz: ZoneInfo) -> dict:
+        """Aggregates only: no identifiers, fingerprints, times of activities
+        or measurements."""
+        by_source: dict = {}
+        for c in self.candidates:
+            entry = by_source.setdefault(c["event"]["source"], {})
+            label = c["decision"] if c["decision"] in ("eligible", "wait") else f"{c['decision']}:{c['reason']}"
+            entry[label] = entry.get(label, 0) + 1
+        new_batches = [{"kind": g.kind, "level": g.level,
+                        "events_by_source": _source_counts(g.events),
+                        # So the approver can recognise the intended session:
+                        # descriptors only, no identifiers or measurements.
+                        "events": sorted(({"source": e["source"], "activity_type": e["activity_type"],
+                                           "local_date": e["local_date"],
+                                           "detected_minutes_ago": _minutes_since(e["eligible_since"],
+                                                                                  self.created_at)}
+                                          for e in g.events), key=_canonical),
+                        "processed_now": f"key:{g.batch_key}" in self.processable
+                        or f"batch:{g.existing_batch_id}" in self.processable}
+                       for g in self.intake.groups]
+        return {
+            "plan_token": self.token,
+            "eligible_events": sum(c["decision"] == "eligible" for c in self.candidates),
+            "events_settling": sum(c["decision"] == "wait" for c in self.candidates),
+            "events_expiring_or_suppressed": sum(c["decision"] in ("expired", "suppressed") for c in self.candidates),
+            "candidates_by_source": by_source,
+            "planned_new_batches": new_batches,
+            "existing_open_batches": len(self.open_batches),
+            "batches_to_process": len(self.processable),
+            "max_batches": self.max_batches,
+            "suitable_for_supervised_execution": not self.blockers,
+            "blockers": self.blockers,
+            "valid_until": fp.iso_utc(self.created_at + PLAN_TTL),
+        }
+
+
+def _minutes_since(moment_text: Optional[str], now: datetime) -> Optional[int]:
+    moment = fp.parse_iso(moment_text)
+    return int((now - moment).total_seconds() // 60) if moment else None
+
+
+def _source_counts(events: list) -> dict:
+    counts: dict = {}
+    for e in events:
+        counts[e["source"]] = counts.get(e["source"], 0) + 1
+    return counts
+
+
 class Dispatcher:
     def __init__(self, store: fs.FeedbackStore, settings: Settings, *, gateway, telegram: Optional[td.TelegramConfig],
                  http_post: Optional[Callable] = None, log: Optional[Callable[..., None]] = None,
@@ -179,9 +287,12 @@ class Dispatcher:
         """Records the first activation once; events older than 24 h at that
         moment are expired instead of receiving late feedback."""
         with self.store.transaction():
-            if self.store.get_meta("feedback_activated_at") is None:
-                self.store.set_meta("feedback_activated_at", fp.iso_utc(now))
-                self.bump("activated")
+            self._set_activation(now)
+
+    def _set_activation(self, now: datetime) -> None:
+        if self.store.get_meta("feedback_activated_at") is None:
+            self.store.set_meta("feedback_activated_at", fp.iso_utc(now))
+            self.bump("activated")
 
     # -- run --------------------------------------------------------------
 
@@ -196,91 +307,121 @@ class Dispatcher:
         return dict(sorted(self.counts.items()))
 
     def recover_stale(self, now: datetime) -> None:
-        now_text = fp.iso_utc(now)
         with self.store.transaction():
-            for batch in self.store.stale_processing_batches(fp.iso_utc(now - PROCESSING_LEASE)):
-                if batch["stage"] == "generate":
-                    # Generation has no external side effect: safe to retry.
-                    self.store.requeue_batch(batch["id"], now_text)
-                    self.bump("recovered_generation")
-                elif batch["parts_total"] and batch["parts_sent"] >= batch["parts_total"]:
-                    # Every part was confirmed by Telegram before the crash.
-                    self.store.finish_batch(batch["id"], "delivered", now_text)
-                    self.bump("recovered_delivered")
-                elif batch["inflight_part"] is None:
-                    # No sendMessage was in flight: nothing can have reached
-                    # Telegram beyond the confirmed parts, so resuming is safe.
-                    self.store.requeue_batch(batch["id"], now_text)
-                    self.bump("recovered_delivery")
-                else:
-                    # A send was in flight and may or may not have reached
-                    # Telegram. At-most-once: never resend; record it.
-                    self.store.finish_batch(batch["id"], "failed", now_text,
-                                            error_category="delivery_outcome_unknown",
-                                            item_reason="delivery_outcome_unknown")
-                    self.bump("failed_delivery_outcome_unknown")
+            self._apply_recovery(now)
+
+    @staticmethod
+    def recovery_action(batch: Any) -> str:
+        """What to do with a batch left 'processing' past its lease."""
+        if batch["stage"] == "generate":
+            return "requeue_generation"     # no external side effect: safe to retry
+        if batch["parts_total"] and batch["parts_sent"] >= batch["parts_total"]:
+            return "mark_delivered"         # every part confirmed before the crash
+        if batch["inflight_part"] is None:
+            return "requeue_delivery"       # no send in flight: resuming is safe
+        return "fail_outcome_unknown"       # a send may have reached Telegram: never resend
+
+    def _apply_recovery(self, now: datetime) -> list:
+        """Returns the ids of batches put back in the queue."""
+        now_text = fp.iso_utc(now)
+        requeued = []
+        for batch in self.store.stale_processing_batches(fp.iso_utc(now - PROCESSING_LEASE)):
+            action = self.recovery_action(batch)
+            if action in ("requeue_generation", "requeue_delivery"):
+                self.store.requeue_batch(batch["id"], now_text)
+                requeued.append(batch["id"])
+                self.bump("recovered_generation" if action == "requeue_generation" else "recovered_delivery")
+            elif action == "mark_delivered":
+                self.store.finish_batch(batch["id"], "delivered", now_text)
+                self.bump("recovered_delivered")
+            else:
+                self.store.finish_batch(batch["id"], "failed", now_text, error_category="delivery_outcome_unknown",
+                                        item_reason="delivery_outcome_unknown")
+                self.bump("failed_delivery_outcome_unknown")
+        return requeued
 
     # -- intake -----------------------------------------------------------
+    #
+    # Planning is read-only and shared by normal runs, the approved-plan
+    # digest and --simulate, so a supervised run executes exactly what was
+    # planned. Applying writes; callers hold the transaction.
 
     def intake(self, now: datetime) -> None:
-        now_text = fp.iso_utc(now)
-        activated_at = self.activated_at()
         with self.store.transaction():
-            eligible = []
-            for event in self.store.candidate_events():
-                self.bump("candidates")
-                verdict = fp.assess_event(event, now=now, activated_at=activated_at,
-                                          apple_health_verified=self.settings.apple_health_verified)
-                if verdict.decision == "wait":
-                    self.bump("waiting_to_settle")
-                elif verdict.decision == "eligible":
-                    eligible.append(event)
-                elif self.store.create_item(event["id"], state=verdict.decision, reason=verdict.reason,
-                                            now_text=now_text):
-                    self.bump(f"items_{verdict.decision}_{verdict.reason}")
-            for group in fp.group_events(eligible):
-                self._queue_group(group, now)
+            self._apply_intake(self.plan_intake(now, self.activated_at()), now)
 
-    def _queue_group(self, group: list, now: datetime) -> None:
-        now_text = fp.iso_utc(now)
+    def plan_intake(self, now: datetime, activated_at: Optional[datetime]) -> "IntakePlan":
+        decisions, eligible = [], []
+        for event in self.store.candidate_events():
+            verdict = fp.assess_event(event, now=now, activated_at=activated_at,
+                                      apple_health_verified=self.settings.apple_health_verified)
+            decisions.append((event, verdict))
+            if verdict.decision == "eligible":
+                eligible.append(event)
+        groups, planned_keys = [], {}
+        for group in fp.group_events(eligible):
+            target = self._target_for_group(group, now, planned_keys)
+            planned_keys[target.batch_key] = target
+            groups.append(target)
+        return IntakePlan(decisions, groups)
+
+    def _target_for_group(self, group: list, now: datetime, planned_keys: dict) -> "GroupPlan":
         tz = self.settings.tz
-        level, _ = self._level_for(group)
+        level, reasons = self._level_for(group)
         today = self.local_date(now)
-        batch_id = None
         if fp.in_quiet_hours(now, tz):
             release = fp.next_release(now, tz)
-            batch_id = self._digest_batch(release.astimezone(tz).date(), release, now_text)
-            if batch_id is not None:
-                self.bump("items_queued_for_morning", len(group))
+            key = f"digest:{release.astimezone(tz).date().isoformat()}"
+            existing = self.store.get_batch_by_key(key)
+            if existing is None:
+                return GroupPlan(group, level, reasons, "morning_digest", key, None, fp.iso_utc(release),
+                                 "queued_for_morning", key not in planned_keys)
+            if existing["state"] == "queued" and existing["stage"] == "generate":
+                return GroupPlan(group, level, reasons, "morning_digest", key, existing["id"], existing["release_at"],
+                                 "queued_for_morning", False)
         else:
-            open_digest = self.store.get_batch_by_key(f"digest:{today.isoformat()}")
-            if open_digest is not None and open_digest["state"] == "queued" and open_digest["stage"] == "generate":
-                batch_id = open_digest["id"]
-                self.bump("items_joined_morning_digest", len(group))
-        if batch_id is None:
-            key = "event:" + ",".join(str(e["id"]) for e in sorted(group, key=lambda e: e["id"]))
-            batch_id = self.store.create_batch(batch_key=key, kind="event", release_at=now_text, now_text=now_text,
-                                               local_date=today.isoformat(), level=level)
-            if batch_id is None:
-                batch_id = self.store.get_batch_by_key(key)["id"]
-            else:
-                self.bump("batches_created_event")
-        for event in group:
-            if self.store.create_item(event["id"], state="queued", batch_id=batch_id, level=level, now_text=now_text):
-                self.bump("items_queued")
-                self.bump(f"items_level_{level}")
-            else:
-                self.bump("items_already_present")
-
-    def _digest_batch(self, release_date: date, release: datetime, now_text: str) -> Optional[int]:
-        key = f"digest:{release_date.isoformat()}"
+            existing = self.store.get_batch_by_key(f"digest:{today.isoformat()}")
+            if existing is not None and existing["state"] == "queued" and existing["stage"] == "generate":
+                return GroupPlan(group, level, reasons, "morning_digest", existing["batch_key"], existing["id"],
+                                 existing["release_at"], "joined_morning_digest", False)
+        key = "event:" + ",".join(str(e["id"]) for e in sorted(group, key=lambda e: e["id"]))
         existing = self.store.get_batch_by_key(key)
-        if existing is not None:
-            joinable = existing["state"] == "queued" and existing["stage"] == "generate"
-            return existing["id"] if joinable else None
-        self.bump("batches_created_morning_digest")
-        return self.store.create_batch(batch_key=key, kind="morning_digest", release_at=fp.iso_utc(release),
-                                       now_text=now_text, local_date=release_date.isoformat())
+        return GroupPlan(group, level, reasons, "event", key, existing["id"] if existing else None, fp.iso_utc(now),
+                         None, existing is None)
+
+    def _apply_intake(self, plan: "IntakePlan", now: datetime) -> dict:
+        """Writes the planned items and batches; returns {batch_key: id}."""
+        now_text = fp.iso_utc(now)
+        for event, verdict in plan.decisions:
+            self.bump("candidates")
+            if verdict.decision == "wait":
+                self.bump("waiting_to_settle")
+            elif verdict.decision != "eligible" and self.store.create_item(
+                    event["id"], state=verdict.decision, reason=verdict.reason, now_text=now_text):
+                self.bump(f"items_{verdict.decision}_{verdict.reason}")
+        batch_ids = {}
+        for target in plan.groups:
+            batch_id = target.existing_batch_id or batch_ids.get(target.batch_key)
+            if batch_id is None:
+                batch_id = self.store.create_batch(
+                    batch_key=target.batch_key, kind=target.kind, release_at=target.release_at, now_text=now_text,
+                    local_date=(fp.parse_iso(target.release_at).astimezone(self.settings.tz).date().isoformat()),
+                    level=target.level if target.kind == "event" else None)
+                if batch_id is None:
+                    batch_id = self.store.get_batch_by_key(target.batch_key)["id"]
+                else:
+                    self.bump(f"batches_created_{target.kind}")
+            batch_ids[target.batch_key] = batch_id
+            if target.counter:
+                self.bump(f"items_{target.counter}", len(target.events))
+            for event in target.events:
+                if self.store.create_item(event["id"], state="queued", batch_id=batch_id, level=target.level,
+                                          now_text=now_text):
+                    self.bump("items_queued")
+                    self.bump(f"items_level_{target.level}")
+                else:
+                    self.bump("items_already_present")
+        return batch_ids
 
     def _level_for(self, events: list) -> "tuple[str, list]":
         times = [fp.event_time(e) for e in events if e["source"] in fp.TRAINING_SOURCES and fp.event_time(e)]
@@ -295,6 +436,144 @@ class Dispatcher:
         baselines = [fp.parse_iso(self.store.baseline_completed_at(s)) for s in fp.TRAINING_SOURCES]
         covers = all(b is not None and b <= first - fp.RETURN_AFTER_GAP for b in baselines)
         return fp.classify_level(events, previous_training_start=previous, history_covers_gap=covers)
+
+    # -- approved plans (supervised runs) ---------------------------------
+
+    def build_plan(self, now: datetime, *, created_at: datetime, max_batches: int) -> "Plan":
+        """Read-only: everything a supervised run at `now` would change or
+        process, canonicalised and hashed. Callers that act on the result
+        must hold the write transaction it was computed in."""
+        tz = self.settings.tz
+        activated = self.activated_at()
+        intake = self.plan_intake(now, activated or now)
+
+        def event_state(e) -> dict:
+            # Row id plus the poller's keyed fingerprint: no provider identifier
+            # enters the payload, and every eligibility-relevant column does.
+            return {"id": e["id"], "source": e["source"], "fingerprint": e["fingerprint"], "state": e["state"],
+                    "status": e["feedback_status"], "eligible": e["feedback_eligible"],
+                    "start": e["start_time_utc"], "end": e["end_time_utc"], "first_seen": e["first_seen_at"],
+                    "eligible_since": e["eligible_since"], "superseded_by": e["superseded_by"]}
+
+        candidates = [{"event": event_state(e), "decision": v.decision, "reason": v.reason}
+                      for e, v in intake.decisions]
+        groups = [{"key": g.batch_key, "kind": g.kind, "level": g.level, "existing_batch": g.existing_batch_id,
+                   "release_at": g.release_at, "events": sorted(e["id"] for e in g.events)} for g in intake.groups]
+
+        open_batches, processable, blockers = [], [], []
+        lease_cutoff = fp.iso_utc(now - PROCESSING_LEASE)
+        for batch in self.store.conn.execute(
+                "SELECT * FROM feedback_batches WHERE state IN ('queued', 'processing') ORDER BY id"):
+            members = self.store.conn.execute(
+                "SELECT event_id, state FROM feedback_items WHERE batch_id = ? ORDER BY event_id",
+                (batch["id"],)).fetchall()
+            recovery = None
+            if batch["state"] == "processing":
+                if batch["processing_started_at"] >= lease_cutoff:
+                    blockers.append("batch_in_progress")     # another run is working on it
+                else:
+                    recovery = self.recovery_action(batch)   # applied inside the approved transaction
+            open_batches.append({k: batch[k] for k in (
+                "id", "batch_key", "kind", "urgency", "level", "state", "stage", "release_at", "next_attempt_at",
+                "generation_attempts", "delivery_attempts", "parts_sent", "parts_total", "inflight_part",
+                "message_sha256")} | {"items": [list(m) for m in members], "recovery": recovery})
+            if batch["state"] == "processing" and recovery not in ("requeue_generation", "requeue_delivery"):
+                continue
+            due = batch["release_at"] <= fp.iso_utc(now) and (
+                batch["next_attempt_at"] is None or batch["next_attempt_at"] <= fp.iso_utc(now))
+            if due and fp.may_process(batch["urgency"], now, tz, self.review_settled):
+                processable.append(f"batch:{batch['id']}")
+        for g in intake.groups:
+            if g.existing_batch_id is not None:
+                ref = f"batch:{g.existing_batch_id}"       # joins an existing open batch
+            else:
+                ref = f"key:{g.batch_key}"                 # new batch (possibly shared by several groups)
+                if g.creates_batch and fp.parse_iso(g.release_at) <= now \
+                        and fp.may_process("routine", now, tz, self.review_settled):
+                    processable.append(ref)
+            if ref not in processable:
+                # Every newly selected event must be handled in this run;
+                # otherwise it would be queued now and sent by a later run
+                # outside this approval.
+                blockers.append("new_events_deferred")
+        processable = sorted(set(processable))
+
+        decisions = [c["decision"] for c in candidates]
+        if "wait" in decisions:
+            blockers.append("events_settling")
+        if not processable:
+            blockers.append("nothing_to_process")
+        if len(processable) > max_batches:
+            blockers.append("exceeds_max_batches")
+        payload = {
+            "version": PLAN_VERSION, "max_batches": max_batches, "created_at": fp.iso_utc(created_at),
+            "activation": fp.iso_utc(activated) if activated else "first_activation",
+            "candidates": sorted(candidates, key=_canonical),
+            "groups": sorted(groups, key=_canonical),
+            "open_batches": sorted(open_batches, key=_canonical),
+            "process": processable,
+        }
+        digest = hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
+        return Plan(digest=digest, created_at=created_at, max_batches=max_batches, intake=intake,
+                    processable=processable, blockers=sorted(set(blockers)), candidates=candidates,
+                    open_batches=open_batches)
+
+    def run_supervised(self, now: datetime, token: str, max_batches: int) -> dict:
+        """Executes exactly one approved plan. The plan is recomputed and
+        compared inside one BEGIN IMMEDIATE transaction (the poller and any
+        other dispatcher are locked out of writing), and only if it matches
+        are activation, intake and the single-use approval record committed.
+        Afterwards only the approved batches are processed; nothing else in
+        the outbox is generated or delivered in this run."""
+        self.counts, self._preflight, self._claude_blocked = {}, None, None
+        try:
+            created_at, digest = parse_plan_token(token)
+        except ValueError:
+            return {"outcome": "plan_invalid"}
+        if now - created_at > PLAN_TTL or created_at - now > PLAN_CLOCK_SKEW:
+            return {"outcome": "plan_stale"}
+        consumed_key = f"dispatcher.plan_consumed.{digest}"
+        conn = self.store.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self.store.get_meta(consumed_key) is not None:
+                conn.execute("ROLLBACK")
+                return {"outcome": "plan_already_used"}
+            plan = self.build_plan(now, created_at=created_at, max_batches=max_batches)
+            if plan.digest != digest:
+                conn.execute("ROLLBACK")
+                return {"outcome": "plan_mismatch", "current_plan": plan.summary(self.settings.tz)}
+            if plan.blockers:
+                conn.execute("ROLLBACK")
+                return {"outcome": "plan_unsuitable", "blockers": plan.blockers}
+            self._apply_recovery(now)
+            self._set_activation(now)
+            batch_ids = self._apply_intake(plan.intake, now)
+            self.store.set_meta(consumed_key, fp.iso_utc(now))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+        approved = sorted(int(ref[6:]) if ref.startswith("batch:") else batch_ids[ref[4:]]
+                          for ref in plan.processable)
+        self.log(event="supervised_plan_accepted", batches=len(approved))
+        for batch_id in approved:
+            batch = self.store.get_batch(batch_id)
+            if batch["state"] != "queued" or not fp.may_process(batch["urgency"], now, self.settings.tz,
+                                                                 self.review_settled):
+                self.bump("approved_batch_not_processable")
+                continue
+            if batch["stage"] == "generate":
+                self.generate(batch_id, now)
+                batch = self.store.get_batch(batch_id)
+            if batch["state"] == "queued" and batch["stage"] == "deliver" and batch["next_attempt_at"] is None:
+                self.deliver(batch_id, now)
+        results = [dict(self.store.get_batch(b)) for b in approved]
+        return {"outcome": "ok", "counts": dict(sorted(self.counts.items())),
+                "approved_batches": [{k: r[k] for k in ("kind", "level", "state", "stage", "parts_sent",
+                                                         "parts_total", "error_category")} for r in results]}
 
     # -- system alerts ----------------------------------------------------
 
@@ -631,7 +910,11 @@ def batch_overview(store: fs.FeedbackStore, tz: ZoneInfo) -> list:
 
 
 def simulate(db_path: Path, settings: Settings, *, start: datetime, until: Optional[datetime],
-             log: Callable[..., None]) -> dict:
+             log: Callable[..., None], max_batches: Optional[int] = None, live_clock: bool = True) -> dict:
+    """Always reports the supervised plan for `start` (computed before any
+    simulated change, so it equals what a live supervised run would see).
+    With max_batches, simulates that supervised run itself; otherwise the
+    normal unattended pipeline, every 15 minutes up to `until`."""
     store = open_simulation_store(db_path, start)
     # Not even `claude auth status` runs in simulation.
     settings = replace(settings, auth_status=lambda: fc.AUTH_NOT_CHECKED)
@@ -640,23 +923,38 @@ def simulate(db_path: Path, settings: Settings, *, start: datetime, until: Optio
     dispatcher = Dispatcher(store, settings, gateway=gateway, telegram=SIMULATED_TELEGRAM, http_post=transport,
                             log=log, owner="simulation")
     ineligible = store.ineligible_event_counts()
-    dispatcher.activate(start)
-    activation_counts = dict(dispatcher.counts)
+    plan = dispatcher.build_plan(start, created_at=start, max_batches=max_batches or 1)
+    plan_summary = plan.summary(settings.tz)
+    if not live_clock:
+        plan_summary["plan_token"] = None
+        plan_summary["note"] = "computed for --at; a live run needs a plan made at the current time"
     ticks, totals, moment = 0, {}, start
     end = until or start
     if end - start > SIMULATION_MAX_SPAN:
         raise ValueError("simulation span is limited to 7 days")
-    while True:
-        counts = dispatcher.run(moment)
-        ticks += 1
-        for name, value in counts.items():
-            totals[name] = totals.get(name, 0) + value
-        if moment + SIMULATION_STEP > end:
-            break
-        moment += SIMULATION_STEP
+    supervised_result = None
+    if max_batches is not None:
+        supervised_result = dispatcher.run_supervised(start, plan.token, max_batches)
+        totals = dict(supervised_result.get("counts", {}))
+        ticks = 1
+        activation_counts = {"activated": totals.get("activated", 0)}
+    else:
+        dispatcher.activate(start)
+        activation_counts = dict(dispatcher.counts)
+        while True:
+            counts = dispatcher.run(moment)
+            ticks += 1
+            for name, value in counts.items():
+                totals[name] = totals.get(name, 0) + value
+            if moment + SIMULATION_STEP > end:
+                break
+            moment += SIMULATION_STEP
     try:
         return {
-            "mode": "simulate",
+            "mode": "simulate_supervised" if max_batches is not None else "simulate",
+            "supervised_plan": plan_summary,
+            "supervised_result": ({k: v for k, v in supervised_result.items() if k != "counts"}
+                                  if supervised_result else None),
             "simulated_from": fp.iso_utc(start),
             "simulated_until": fp.iso_utc(moment),
             "ticks": ticks,
@@ -791,12 +1089,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help="back up the store, then drop the v2 tables (rollback; keeps all detections)")
     mode.add_argument("--requeue-failed-delivery", action="store_true",
                       help="requeue feedback whose delivery Telegram definitively rejected (never ambiguous ones)")
+    parser.add_argument("--expect-plan", default=None, metavar="TOKEN",
+                        help="with --once: run only the approved plan printed by --simulate (supervised run)")
+    parser.add_argument("--max-batches", type=int, default=None,
+                        help="supervised batch limit (required with --expect-plan; also accepted by --simulate)")
     parser.add_argument("--at", default=None, help="simulation start time (ISO 8601; default now)")
     parser.add_argument("--until", default=None, help="simulation end time; steps every 15 minutes")
     parser.add_argument("--repo-root", default=None, help="override the resolved repository root")
     parser.add_argument("--env-file", default=None, help="env file (default runner/config.env)")
     parser.add_argument("--db-path", default=None, help="event store path (default runtime/events.sqlite3)")
     return parser
+
+
+def argument_problem(args) -> Optional[str]:
+    """Rejects ambiguous combinations instead of guessing."""
+    if args.expect_plan is not None and not args.once:
+        return "--expect-plan is only valid with --once"
+    if args.once and args.expect_plan is not None and args.max_batches is None:
+        return "--expect-plan requires --max-batches"
+    if args.max_batches is not None:
+        if not (args.simulate or (args.once and args.expect_plan is not None)):
+            return "--max-batches is only valid with --simulate or with --once --expect-plan"
+        if not 1 <= args.max_batches <= MAX_SUPERVISED_BATCHES:
+            return f"--max-batches must be between 1 and {MAX_SUPERVISED_BATCHES}"
+        if args.simulate and args.until is not None:
+            return "--max-batches simulates a single supervised run; --until is not supported with it"
+    if (args.at is not None or args.until is not None) and not args.simulate:
+        return "--at and --until are only valid with --simulate"
+    return None
 
 
 def settings_from_env(env: dict, repo_root: Path, tz: ZoneInfo) -> Settings:
@@ -819,7 +1139,12 @@ def _parse_cli_time(value: Optional[str], default: datetime) -> datetime:
 
 def main(argv: Optional[list] = None, *, now_fn: Optional[Callable[[], datetime]] = None,
          gateway_factory: Optional[Callable] = None, http_post: Optional[Callable] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    problem = argument_problem(args)
+    if problem:
+        print(json.dumps({"outcome": "failed", "error_category": "invalid_arguments", "error": problem}))
+        return 2
     repo_root = Path(args.repo_root).resolve() if args.repo_root else wr.default_repo_root()
     env = wr.load_env_file(Path(args.env_file) if args.env_file else repo_root / "runner" / "config.env")
     env.update(os.environ)
@@ -888,7 +1213,8 @@ def main(argv: Optional[list] = None, *, now_fn: Optional[Callable[[], datetime]
         try:
             start = _parse_cli_time(args.at, now)
             until = _parse_cli_time(args.until, start) if args.until else None
-            summary = simulate(db_path, settings, start=start, until=until, log=log)
+            summary = simulate(db_path, settings, start=start, until=until, log=log, max_batches=args.max_batches,
+                               live_clock=args.at is None)
         except ValueError as exc:
             return fail("invalid_arguments", 2, error=str(exc))
         except (es.StoreError, sqlite3.Error) as exc:
@@ -944,6 +1270,19 @@ def main(argv: Optional[list] = None, *, now_fn: Optional[Callable[[], datetime]
             telegram = td.load_telegram_config(env)
             dispatcher = Dispatcher(store, settings, gateway=gateway, telegram=telegram, http_post=http_post, log=log)
             started = fp.iso_utc(now)
+            if args.expect_plan:
+                result = dispatcher.run_supervised(now, args.expect_plan, args.max_batches)
+                if result["outcome"] != "ok":
+                    # Rejected before any change: nothing written, no Claude, no Telegram.
+                    log(event="supervised_rejected", outcome=result["outcome"])
+                    print(json.dumps(result, indent=2, sort_keys=True))
+                    return 3
+                with store.transaction():
+                    store.record_dispatch_run(started_at=started, finished_at=fp.iso_utc(datetime.now(UTC)),
+                                              mode="supervised", outcome="ok", summary=result["counts"])
+                log(event="dispatch_end", outcome="ok", mode="supervised", counts=result["counts"])
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return 0
             dispatcher.activate(now)
             counts = dispatcher.run(now)
             with store.transaction():
