@@ -77,7 +77,7 @@ Any record first seen with an event date more than 3 days before the athlete's l
 
 ## Database Schema
 
-`runtime/events.sqlite3` (`0600`; `runtime/` is gitignored). Schema version 1.
+`runtime/events.sqlite3` (`0600`; `runtime/` is gitignored). Schema version 1. Version 2 only adds the feedback dispatcher's own tables (`runner/feedback-dispatcher.md`); the poller works unchanged on either version and never migrates the store itself.
 
 | Table | Contents |
 |---|---|

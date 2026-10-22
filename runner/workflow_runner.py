@@ -530,7 +530,10 @@ def build_structured_output_json_schema() -> dict:
     return {"type": "object", "properties": properties, "required": required}
 
 
-def invoke_claude(prompt: str, config: RunnerConfig) -> subprocess.CompletedProcess:
+def invoke_claude(prompt: str, config: RunnerConfig,
+                  json_schema: Optional[dict] = None) -> subprocess.CompletedProcess:
+    """json_schema defaults to the Daily Review contract; other callers (the
+    feedback dispatcher) pass their own."""
     argv = [
         config.claude_binary,
         "--print",
@@ -543,7 +546,8 @@ def invoke_claude(prompt: str, config: RunnerConfig) -> subprocess.CompletedProc
         # --json-schema is a single-value (non-variadic) flag, so it's safe as
         # two argv elements. Enforces the Structured Result Contract's shape
         # at the CLI boundary -- see build_structured_output_json_schema().
-        "--json-schema", json.dumps(build_structured_output_json_schema()),
+        "--json-schema", json.dumps(json_schema if json_schema is not None
+                                    else build_structured_output_json_schema()),
     ]
     if config.claude_model:
         argv += ["--model", config.claude_model]

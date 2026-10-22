@@ -84,8 +84,9 @@ class TelegramNetworkError(TelegramDeliveryError):
 
 
 class TelegramAPIError(TelegramDeliveryError):
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, retry_after: Optional[int] = None):
         self.status_code = status_code
+        self.retry_after = retry_after
         super().__init__(message)
 
 
@@ -223,12 +224,33 @@ def _extract_api_error(response_body: str) -> str:
     return response_body[:200] if response_body else "no response body"
 
 
-def _send_part(config: TelegramConfig, text: str, http_post: Callable) -> None:
+def _extract_retry_after(response_body: str) -> Optional[int]:
+    try:
+        payload = json.loads(response_body)
+        value = payload.get("parameters", {}).get("retry_after")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _extract_message_id(response_body: str) -> Optional[int]:
+    try:
+        payload = json.loads(response_body)
+        value = payload.get("result", {}).get("message_id")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _send_part(config: TelegramConfig, text: str, http_post: Callable) -> Optional[int]:
+    """One sendMessage call. Returns Telegram's message_id when the reply
+    carries one."""
     url = f"{TELEGRAM_API_BASE}/bot{config.bot_token}/sendMessage"
     data = {"chat_id": config.chat_id, "text": text}
     status, body = http_post(url, data)
     if status != 200:
-        raise TelegramAPIError(status, _extract_api_error(body))
+        raise TelegramAPIError(status, _extract_api_error(body), _extract_retry_after(body))
+    return _extract_message_id(body)
 
 
 def _send_part_with_retry(
@@ -345,6 +367,19 @@ def send_telegram_notification(
     result["parts_sent"] = sent
     log(event="notify_end", status="sent", parts_sent=sent, parts_total=len(parts))
     return result
+
+
+def send_single_message(config: TelegramConfig, text: str, *, http_post: Optional[Callable] = None) -> Optional[int]:
+    """Exactly one sendMessage attempt, no retry, for callers that track
+    delivery state themselves (the feedback dispatcher's outbox). Returns the
+    message_id; raises TelegramAPIError or TelegramNetworkError (both with
+    redacted messages), or the transport's own timeout exception."""
+    try:
+        return _send_part(config, text, http_post or _default_http_post)
+    except TelegramAPIError as exc:
+        raise TelegramAPIError(exc.status_code, redact_secrets(str(exc)), exc.retry_after) from None
+    except TelegramNetworkError as exc:
+        raise TelegramNetworkError(redact_secrets(str(exc))) from None
 
 
 def deliver_review(

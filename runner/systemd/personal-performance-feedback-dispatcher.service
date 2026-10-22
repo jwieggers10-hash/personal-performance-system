@@ -1,0 +1,38 @@
+[Unit]
+Description=Personal Performance System - event feedback dispatcher (one-shot)
+Documentation=file:///home/coach/personal-performance-system/runner/feedback-dispatcher.md
+Wants=network-online.target
+After=network-online.target
+
+# TEMPLATE (Phase 4.3): not installed, not enabled. See runner/feedback-dispatcher.md
+# Deployment. It does nothing live until FEEDBACK_DISPATCH_ENABLED=true is set in
+# runner/config.env, and it refuses to run on a store that has not been migrated
+# to schema v2.
+
+[Service]
+Type=oneshot
+User=coach
+Group=coach
+WorkingDirectory=/home/coach/personal-performance-system
+
+# Needs runner/config.env (Telegram token, Claude settings) -- unlike the
+# poller unit, which is deliberately denied both this file and ~/.claude.
+EnvironmentFile=/home/coach/personal-performance-system/runner/config.env
+ExecStart=/usr/bin/python3 runner/feedback_dispatcher.py --once
+
+# A failed run is retried by the next timer tick; the outbox carries all state.
+Restart=no
+# Worst case: MAX_GENERATIONS_PER_RUN (3) x 2 Claude calls x CLAUDE_TIMEOUT_SECONDS
+# (600) plus Telegram sends. Kept under the dispatcher's 45-minute processing
+# lease so a killed run is always recovered safely.
+TimeoutStartSec=40min
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# Claude Code must be able to refresh its own login under ~/.claude, so the
+# home directory stays writable for this unit (as for the Daily Review).
+
+SyslogIdentifier=feedback-dispatcher
+
+# No [Install] section: started only by personal-performance-feedback-dispatcher.timer.

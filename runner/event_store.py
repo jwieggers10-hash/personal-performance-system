@@ -23,6 +23,12 @@ from typing import Any, Iterator, Optional
 
 
 SCHEMA_VERSION = 1
+# Versions this module (and therefore the detect-only poller) can operate on.
+# Version 2 only adds the feedback dispatcher's own tables (feedback_store.py);
+# every v1 table and column is unchanged, so the poller reads and writes a v2
+# store exactly as before. This module never upgrades a store itself: the v1 ->
+# v2 migration is an explicit, separate step (feedback_dispatcher.py --migrate).
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -201,7 +207,7 @@ class EventStore:
             if row is None:
                 self.conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                                   (str(SCHEMA_VERSION),))
-            elif int(row["value"]) != SCHEMA_VERSION:
+            elif int(row["value"]) not in SUPPORTED_SCHEMA_VERSIONS:
                 raise StoreError(f"unsupported event store schema version {row['value']}")
 
     @contextmanager
@@ -302,8 +308,9 @@ class EventStore:
         last_run = self.conn.execute(
             "SELECT started_at, finished_at, outcome FROM poll_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        version = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": int(version["value"]) if version else SCHEMA_VERSION,
             "sources": sources,
             "last_poll_run": dict(last_run) if last_run else None,
             "total_changes_recorded": self.conn.execute("SELECT COUNT(*) FROM event_changes").fetchone()[0],

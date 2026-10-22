@@ -1,0 +1,21 @@
+[Unit]
+Description=15-minute trigger for the Personal Performance event feedback dispatcher
+
+# TEMPLATE (Phase 4.3): not installed, not enabled.
+
+[Timer]
+# Five minutes after each event-poller tick (:02/:17/:32/:47), so fresh
+# detections are picked up promptly, and never on :00. Routine work is held
+# during quiet hours (22:00 until after the 07:00 Daily Review, Europe/Amsterdam,
+# enforced in code and DST-aware), and no Claude call starts while the Daily
+# Review's lock is held -- so the dispatcher never competes with it.
+OnCalendar=*-*-* *:07,22,37,52:00
+AccuracySec=30s
+
+# Missed ticks are not replayed; queued work stays in the outbox.
+Persistent=false
+
+Unit=personal-performance-feedback-dispatcher.service
+
+[Install]
+WantedBy=timers.target
