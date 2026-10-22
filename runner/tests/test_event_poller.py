@@ -28,7 +28,7 @@ import athletedata_client as adc  # noqa: E402
 import event_poller as ep  # noqa: E402
 import event_store as es  # noqa: E402
 from fake_athletedata import (  # noqa: E402
-    SYNTHETIC_KEY, SYNTHETIC_URL, FakeAthleteData, garmin_activity, hevy_deleted, hevy_updated,
+    SYNTHETIC_KEY, SYNTHETIC_URL, FakeAthleteData, garmin_activity, hevy_deleted, hevy_updated, text_result,
 )
 
 TZ = ZoneInfo("Europe/Amsterdam")
@@ -460,6 +460,51 @@ class AppleHealthTests(PollerTestCase):
                 self.assertEqual(self.h.state("apple_health")["health"], "structure_unrecognized")
                 self.assertIsNone(self.h.state("apple_health")["baseline_completed_at"])
                 self.assertEqual(self.h.events("apple_health"), [])
+
+    @staticmethod
+    def realistic(day: str, kind: str, value: float, uuid: str) -> dict:
+        """Record shape observed from production on 2026-10-22 (synthetic values)."""
+        return {"date": day, "startDate": f"{day}T07:12:00.000+0200", "type": kind, "uuid": uuid, "value": value}
+
+    def test_production_first_baseline_then_next_day_reconciliation(self):
+        """Mirrors production: the day's reconciliation ran while the source
+        returned prose; records then appeared, so the baseline came from the
+        4-day window mid-day. The next morning's 14-day reconciliation sees
+        older history for the first time -- it must be backfill, never new."""
+        days = [f"2026-10-{d:02d}" for d in range(8, 21)]
+        history = {"weight": [self.realistic(d, "body_mass", 80.0 + i / 10, f"w-{d}") for i, d in enumerate(days)],
+                   "bodyFat": [self.realistic(d, "body_fat", 0.20 + i / 1000, f"f-{d}") for i, d in enumerate(days)]}
+
+        def serve(arguments):
+            return {name: [r for r in records if arguments["start_date"] <= r["date"] <= arguments["end_date"]]
+                    for name, records in history.items()}
+        self.h.fake.apple = None
+        self.h.poll(NOW - timedelta(hours=2))  # reconciliation done, no data
+        with mock.patch.object(self.h.fake, "_apple_health_get_body_composition",
+                               side_effect=lambda a: text_result(serve(a))):
+            self.h.poll(NOW)  # first structured response: 4-day window baseline
+            baseline = self.h.events("apple_health")
+            self.assertEqual({r["state"] for r in baseline}, {"baseline"})
+            self.assertEqual(len(baseline), 2 * 4)  # 2026-10-17..20
+
+            # A re-sync of the same records (same uuid, same value) changes nothing.
+            self.h.poll(NOW + timedelta(minutes=15))
+            self.assertEqual(len(self.h.events("apple_health")), 8)
+
+            # Next local day: 14-day reconciliation plus one genuinely new weigh-in.
+            history["weight"].append(self.realistic("2026-10-21", "body_mass", 79.5, "w-new"))
+            self.h.poll(NOW + timedelta(days=1))
+        rows = self.h.events("apple_health")
+        by_status: dict = {}
+        for row in rows:
+            by_status[row["feedback_status"]] = by_status.get(row["feedback_status"], 0) + 1
+        # 2026-10-08..16 first seen now: more than 3 days old -> backfill.
+        self.assertEqual(by_status["suppressed_backfill"], 2 * 9)
+        self.assertEqual(by_status["suppressed_baseline"], 8)
+        # The new weigh-in is detected but stays ineligible while unverified.
+        self.assertEqual(by_status["unverified_structure"], 1)
+        self.assertNotIn("pending", by_status)
+        self.assertEqual(sum(r["feedback_eligible"] for r in rows), 0)
 
     def test_window_is_four_days_with_fourteen_day_daily_reconciliation(self):
         self.h.fake.apple = {"weight": [], "bodyFat": []}
