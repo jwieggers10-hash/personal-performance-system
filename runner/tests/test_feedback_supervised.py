@@ -330,6 +330,136 @@ class ExistingOutboxTests(SupervisedTestCase):
         self.assertEqual(self.store.get_batch(batch_id)["error_category"], "delivery_outcome_unknown")
 
 
+class ExecutionLaterThanSimulationTests(SupervisedTestCase):
+    """The operator approves a plan and runs it seconds or minutes later. A
+    new event batch's release time is that execution instant, so it must not
+    enter the digest -- but every real change still has to abort the run."""
+
+    def test_unchanged_plan_matches_at_any_point_within_the_token_lifetime(self):
+        for delay in (timedelta(seconds=1), timedelta(seconds=30), timedelta(minutes=5), timedelta(minutes=19)):
+            with self.subTest(delay=delay):
+                self.tearDown()
+                self.setUp()
+                self.add("h1", source="hevy", activity_type=None, event_type="workout",
+                         start=NOW - timedelta(hours=3))
+                plan = self.plan()
+                later = NOW + delay
+                self.assertEqual(self.dispatcher().build_plan(later, created_at=NOW, max_batches=1).digest,
+                                 plan.digest)
+                self.assertEqual(self.dispatcher().run_supervised(later, plan.token, 1)["outcome"], "ok")
+                self.assertEqual(len(self.transport.sent), 1)
+                # The committed batch keeps its real release time.
+                self.assertEqual([b["release_at"] for b in batches(self.store)], [fp.iso_utc(later)])
+
+    def test_new_event_after_simulation_still_aborts(self):
+        self.add("h1", source="hevy", activity_type=None, event_type="workout", start=NOW - timedelta(hours=3))
+        plan = self.plan()
+        self.add("h-late", source="hevy", activity_type=None, event_type="workout", start=NOW - timedelta(hours=8))
+        before = self.state()
+        self.assert_rejected(self.dispatcher().run_supervised(NOW + timedelta(seconds=30), plan.token, 1),
+                             "plan_mismatch", before)
+
+    def test_eligibility_change_after_simulation_aborts(self):
+        self.add("h1", source="hevy", activity_type=None, event_type="workout", start=NOW - timedelta(hours=3))
+        plan = self.plan()
+        with self.store.transaction():
+            self.store.store.update_event("hevy", "h1", feedback_status="held", feedback_eligible=0)
+        before = self.state()
+        self.assert_rejected(self.dispatcher().run_supervised(NOW + timedelta(seconds=30), plan.token, 1),
+                             "plan_mismatch", before)
+
+    def test_notification_window_closing_after_simulation_aborts(self):
+        with self.store.transaction():
+            self.store.set_meta("feedback_activated_at", fp.iso_utc(NOW - timedelta(days=2)))
+        self.add("h1", source="hevy", activity_type=None, event_type="workout", start=NOW - timedelta(hours=25),
+                 first_seen=NOW - fp.NOTIFICATION_WINDOW + timedelta(seconds=10))
+        plan = self.plan()
+        self.assertEqual(plan.blockers, [])
+        before = self.state()
+        self.assert_rejected(self.dispatcher().run_supervised(NOW + timedelta(seconds=30), plan.token, 1),
+                             "plan_mismatch", before)
+
+    def test_grouping_change_after_simulation_aborts(self):
+        self.add("g1", start=NOW - timedelta(hours=9))
+        self.add("g2", start=NOW - timedelta(hours=2))
+        plan = self.plan(max_batches=2)
+        with self.store.transaction():  # move g1 next to g2: now one group
+            self.store.store.update_event("garmin", "g1", start_time_utc=fp.iso_utc(NOW - timedelta(hours=3)),
+                                          end_time_utc=fp.iso_utc(NOW - timedelta(hours=2, minutes=15)))
+        before = self.state()
+        self.assert_rejected(self.dispatcher().run_supervised(NOW + timedelta(seconds=30), plan.token, 2),
+                             "plan_mismatch", before)
+
+    def test_changed_release_of_an_existing_batch_aborts(self):
+        self.add("g-old", start=NOW - timedelta(hours=5))
+        make_dispatcher(self.store, telegram=None, gateway=self.gateway).run(NOW - timedelta(minutes=30))
+        self.gateway.prompts.clear()
+        plan = self.plan()
+        self.assertEqual(plan.summary(TZ)["existing_open_batches"], 1)
+        with self.store.transaction():
+            self.store.update_batch(batches(self.store)[0]["id"], fp.iso_utc(NOW),
+                                    release_at=fp.iso_utc(NOW - timedelta(minutes=1)))
+        before = self.state()
+        self.assert_rejected(self.dispatcher().run_supervised(NOW + timedelta(seconds=30), plan.token, 1),
+                             "plan_mismatch", before)
+
+    def test_stale_token_still_rejected(self):
+        self.add("g1")
+        plan = self.plan()
+        before = self.state()
+        self.assert_rejected(self.dispatcher().run_supervised(NOW + fd.PLAN_TTL + timedelta(seconds=1),
+                                                              plan.token, 1), "plan_stale", before)
+
+    def test_reused_token_rejected_after_delayed_execution(self):
+        self.add("g1")
+        plan = self.plan()
+        self.assertEqual(self.dispatcher().run_supervised(NOW + timedelta(seconds=30), plan.token, 1)["outcome"],
+                         "ok")
+        before, sent = self.state(), list(self.transport.sent)
+        result = self.dispatcher().run_supervised(NOW + timedelta(minutes=2), plan.token, 1)
+        self.assertEqual(result["outcome"], "plan_already_used")
+        self.assertEqual((self.state(), self.transport.sent), (before, sent))
+
+    def test_concurrent_delayed_dispatchers_send_once(self):
+        self.add("g1")
+        plan = self.plan()
+        outcomes, transports = [], [FakeTelegram(), FakeTelegram()]
+        barrier = threading.Barrier(2)
+
+        def run(transport, delay):
+            store = fs.FeedbackStore(es.EventStore.open(self.path))
+            try:
+                d = make_dispatcher(store, transport=transport)
+                barrier.wait()
+                outcomes.append(d.run_supervised(NOW + delay, plan.token, 1)["outcome"])
+            finally:
+                store.store.close()
+        threads = [threading.Thread(target=run, args=(t, timedelta(seconds=s)))
+                   for t, s in zip(transports, (30, 45))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(outcomes)[0], "ok")
+        self.assertIn(sorted(outcomes)[1], ("plan_already_used", "plan_mismatch"))
+        self.assertEqual(len(transports[0].sent) + len(transports[1].sent), 1)
+
+    def test_only_the_approved_batch_is_delivered_after_delay(self):
+        self.add("g-old", start=NOW - timedelta(hours=5))
+        make_dispatcher(self.store, telegram=None, gateway=self.gateway).run(NOW - timedelta(minutes=30))
+        self.gateway.prompts.clear()
+        with self.store.transaction():
+            self.store.update_batch(batches(self.store)[0]["id"], fp.iso_utc(NOW),
+                                    next_attempt_at=fp.iso_utc(NOW + timedelta(hours=1)))
+        self.add("g-new", start=NOW - timedelta(hours=2))
+        plan = self.plan()
+        self.assertEqual(plan.blockers, [])
+        self.assertEqual(self.dispatcher().run_supervised(NOW + timedelta(minutes=3), plan.token, 1)["outcome"],
+                         "ok")
+        self.assertEqual(len(self.transport.sent), 1)
+        self.assertEqual(sorted(b["state"] for b in batches(self.store)), ["delivered", "queued"])
+
+
 class RevalidationAfterApprovalTests(SupervisedTestCase):
     def test_event_invalidated_after_commit_is_suppressed_not_substituted(self):
         self.add("g1")
@@ -432,14 +562,14 @@ class CommandLineTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def main(self, *argv, enabled=True):
+    def main(self, *argv, enabled=True, now=NOW):
         out = io.StringIO()
         env = {"FEEDBACK_DISPATCH_ENABLED": "true" if enabled else ""}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.dict(os.environ, env), \
                 mock.patch.object(fc, "cli_auth_status", return_value=fc.AUTH_LOGGED_IN):
             code = fd.main([*argv, "--repo-root", str(self.root), "--env-file", str(self.env),
-                            "--db-path", str(self.path)], now_fn=lambda: NOW,
+                            "--db-path", str(self.path)], now_fn=lambda: now,
                            gateway_factory=lambda config: self.gateway, http_post=self.transport)
         return code, json.loads(out.getvalue())
 
@@ -455,6 +585,15 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(len(self.transport.sent), 1)
         code, again = self.main("--once", "--expect-plan", plan["plan_token"], "--max-batches", "1")
         self.assertEqual((code, again["outcome"]), (3, "plan_already_used"))
+        self.assertEqual(len(self.transport.sent), 1)
+
+    def test_supervised_run_seconds_after_simulation(self):
+        # Production order: simulate, review, then execute in a later second.
+        _, report = self.main("--simulate", "--max-batches", "1")
+        token = report["supervised_plan"]["plan_token"]
+        code, result = self.main("--once", "--expect-plan", token, "--max-batches", "1",
+                                 now=NOW + timedelta(seconds=30))
+        self.assertEqual((code, result["outcome"]), (0, "ok"))
         self.assertEqual(len(self.transport.sent), 1)
 
     def test_mismatch_exits_without_changes(self):

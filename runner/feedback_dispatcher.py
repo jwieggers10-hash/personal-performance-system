@@ -455,10 +455,20 @@ class Dispatcher:
                     "start": e["start_time_utc"], "end": e["end_time_utc"], "first_seen": e["first_seen_at"],
                     "eligible_since": e["eligible_since"], "superseded_by": e["superseded_by"]}
 
+        def release(g) -> str:
+            # A new event batch is released the instant it is created, i.e. at
+            # execution time. Hashing that instant would make every approval
+            # mismatch a run made even a second later, so the digest records
+            # the rule instead; the batch itself still stores the real time.
+            # Morning-digest and existing batches keep their fixed release times.
+            if g.kind == "event" and g.existing_batch_id is None:
+                return "on_execution"
+            return g.release_at
+
         candidates = [{"event": event_state(e), "decision": v.decision, "reason": v.reason}
                       for e, v in intake.decisions]
         groups = [{"key": g.batch_key, "kind": g.kind, "level": g.level, "existing_batch": g.existing_batch_id,
-                   "release_at": g.release_at, "events": sorted(e["id"] for e in g.events)} for g in intake.groups]
+                   "release_at": release(g), "events": sorted(e["id"] for e in g.events)} for g in intake.groups]
 
         open_batches, processable, blockers = [], [], []
         lease_cutoff = fp.iso_utc(now - PROCESSING_LEASE)
