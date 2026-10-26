@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily 21:30 Europe/Amsterdam trigger for the Personal Performance Evening Nutrition Review
+
+[Timer]
+# DST-aware, independent of the server's UTC clock (20:30 UTC in winter,
+# 19:30 UTC in summer). Not on a feedback-dispatcher minute (:07/:22/:37/:52)
+# and before its 22:00 quiet hours.
+OnCalendar=*-*-* 21:30:00 Europe/Amsterdam
+AccuracySec=1min
+
+# A missed review is not replayed later in the night; the next morning's
+# Daily Review covers the finished day. The script also refuses to run an
+# automated review outside 21:00-23:45 local.
+Persistent=false
+
+Unit=personal-performance-evening-nutrition-review.service
+
+[Install]
+WantedBy=timers.target

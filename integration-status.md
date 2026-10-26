@@ -58,29 +58,40 @@ Treat RPE as unavailable rather than assumed zero. Do not rely on Hevy timestamp
 ## Cronometer MCP Verification
 
 Status:
-PARTIAL
+PASS (Operational) — re-verified 2026-10-26 (Phase 5A/5B); Phase 1 rated it PARTIAL.
 
 Summary:
-The Cronometer integration is connected and returns correctly attributed nutrition data, but no complete day of historical nutrition data could be retrieved; only the current in-progress day contained real entries.
+Cronometer nutrition arrives through AthleteData's `food_log_get` (via Terra). Historical days are now retrievable: weekly aggregates back to late July 2026 and full entries for any requested range, with the day boundaries taken from the `timezone` argument (Europe/Amsterdam). The Phase 1 finding that only the current day held data no longer applies.
 
 Verified capabilities:
-- Records are explicitly attributed to Cronometer via a source field.
-- Daily calorie, protein, carbohydrate, fat, and fiber totals are populated and internally consistent with entry-level data when present.
-- Stable entry identifiers are returned.
+- Per meal-slot entries (breakfast, lunch, dinner, snack) with calories, protein, carbohydrate, fat, and usually fiber and sodium; per-day totals; weekly aggregates over logged days.
+- A daily micronutrient row per day (no calories) carrying the full Cronometer micronutrient panel.
+- `sync.providers[].latest_data_received_at`: when Cronometer data last reached AthleteData.
 
 Known limitations:
-- No real nutrition data was found for any date across a roughly 2.5-month test window; only a zero-valued placeholder record existed for the day before the current day.
-- Multiple foods within a single meal are merged into one combined record rather than itemized individually.
-- Timestamps default to midnight rather than reflecting actual meal times.
+- Foods in one meal slot are merged into one entry; meal times are placeholders (midnight), so meal timing cannot be analysed.
+- Sync has no fixed cadence. Over 13–26 Oct 2026 each day's entries arrived in one batch, mostly 18:30–20:30 local, once at 21:32; anything logged after the last sync is absent.
+- Quick-add entries carry calories and macros but no fiber, sodium or micronutrients, understating those totals for the day.
+- Logging completeness varies (in the last 13 finished days of the 5A sample: 9 fully logged, 3 partial, 1 empty). A missing or short day is a logging gap, not evidence of low intake.
+- Cronometer's own targets are not exposed; approved targets live in `goals.md`.
 
-Root cause of limitations:
-Undetermined. This could be an athlete logging gap (no meals recorded in Cronometer during the tested window) or a Terra-bridge sync/backfill gap. It cannot be distinguished from AthleteData responses alone.
+Impact:
+Daily and multi-day nutrition analysis is supported when the day's log is complete. Completeness must be judged per day (`runner/nutrition_data.py`), and trends use fully logged days only.
 
-Impact on Phase 2:
-Historical nutrition trend analysis should be considered provisional until historical Cronometer data is confirmed. Daily nutrition analysis works when data is present, but long-term nutrition trends should not be relied upon until the historical data gap is understood.
+## Garmin Daily Expenditure Verification
 
-Recommendation:
-Confirm directly in the Cronometer app whether historical entries exist for the tested window before relying on this integration for nutrition trends.
+Status:
+PASS (Operational) — verified 2026-10-26 (Phase 5B) via `garmin_get_daily_summaries`.
+
+Verified capabilities:
+- Per calendar day: `bmrKilocalories` (resting) and `activeKilocalories` (above resting, the watch's all-day tally); total = resting + active.
+- `day_window_hours` and `is_partial_day`: a day in progress is a cumulative snapshot covering only part of the day (for example 19.1 of 24 hours at 20:00 local).
+
+Known limitations:
+- Today's figures are never final before midnight; they cannot be compared with a full day's intake as if covering the same period.
+- An activity's `activeKilocalories` includes resting calories during the session and overlaps the daily active figure; activity and daily calories are never added together.
+- Strength sessions logged in Hevy are not recorded as Garmin activities; their effort appears only in the all-day active figure, as far as the watch measured it.
+- Expenditure is a device estimate, not a measurement.
 
 ## Apple Health MCP Verification
 
@@ -109,3 +120,7 @@ Body-composition trend tracking is usable if duplicates are excluded (not averag
 
 Recommendation:
 Deduplicate by (date, value) rather than averaging when computing trends. Revisit FeelFit-specific attribution if AthleteData adds a source field in the future.
+
+Update (2026-10-26, Phase 5A):
+- Records now carry a time of day (`startDate`); morning weigh-ins are consistent (about 37 in 60 days).
+- One conflicting same-date duplicate was observed (two body-fat values 9 s apart on 2026-09-22). Conflicting same-date values are excluded, never averaged; identical duplicates count once.

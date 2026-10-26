@@ -38,7 +38,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 try:
     from zoneinfo import ZoneInfo
@@ -290,6 +290,7 @@ def build_prompt(
     local_date: date,
     athlete_timezone: str,
     athlete_context: Optional[str],
+    prompt_supplement: Optional[str] = None,
 ) -> str:
     previous_date = local_date - timedelta(days=1)
     governing_docs_list = "\n".join(f"- {doc}" for doc in governing_documents) or "(none found)"
@@ -303,6 +304,7 @@ def build_prompt(
         )
 
     all_result_fields = list(RUNNER_ENVELOPE_FIELDS) + list(WORKFLOW_RESULT_FIELDS) + ["human_readable_review"]
+    supplement_block = f"\n{prompt_supplement.strip()}\n" if prompt_supplement else ""
 
     return f"""You are executing the "{workflow_name}" coaching workflow.
 
@@ -318,7 +320,7 @@ Execution details:
 - Athlete local date: {local_date.isoformat()}
 - Athlete timezone: {athlete_timezone}
 - Previous local date: {previous_date.isoformat()}
-{context_block}
+{context_block}{supplement_block}
 Retrieve fresh AthleteData yourself using the available AthleteData MCP tools. Do not rely on
 memory of prior sessions. Follow data-source-policy.md for source authority and duplicate
 handling, and integration-status.md for known limitations -- never assume a field is available
@@ -407,6 +409,11 @@ class WorkflowLock:
                 return
 
         raise DuplicateExecutionError(f"Lock already held: {self.path}")
+
+    def is_held(self) -> bool:
+        """Another process holds this lock: the file exists and is not stale
+        by the same rule acquire() applies. Read-only."""
+        return self.path.exists() and not self._is_stale()
 
     def release(self) -> None:
         if self._acquired:
@@ -803,11 +810,18 @@ def log_event(config: Optional[RunnerConfig], **fields: Any) -> None:
 # Orchestration
 # --------------------------------------------------------------------------
 
-# Only the daily review exists so far; each entry names the review-type
-# subdirectory under reviews/ that the workflow writes into (see Extensibility
-# in runner/workflow-runner.md for how a future workflow registers here).
+# Each entry names the review-type subdirectory under reviews/ that the
+# workflow writes into (see Extensibility in runner/workflow-runner.md for how
+# a future workflow registers here).
 WORKFLOW_REVIEW_TYPES = {
     "daily-review": "daily",
+    "evening-nutrition-review": "nutrition",
+}
+
+# Workflows that need runner-computed facts in their prompt and so must be
+# started through their own entry point, never through this CLI directly.
+WORKFLOW_ENTRY_POINTS = {
+    "evening-nutrition-review": "runner/evening_nutrition_review.py",
 }
 
 
@@ -817,7 +831,11 @@ def run_workflow(
     config: RunnerConfig,
     athlete_context: Optional[str] = None,
     now: Optional[datetime] = None,
+    prepare_prompt: Optional[Callable[[datetime], Optional[str]]] = None,
 ) -> dict:
+    """prepare_prompt, when given, runs under the workflow lock after the
+    duplicate check and before Claude; its text is added to the prompt (the
+    Evening Nutrition Review passes its computed facts this way)."""
     exec_id = execution_id()
     started_at = datetime.now(dt_timezone.utc)
 
@@ -908,6 +926,7 @@ def run_workflow(
                       skipped_stage="before_claude")
             return result
 
+        prompt_supplement = prepare_prompt(local_dt) if prepare_prompt else None
         governing_documents = parse_governing_documents(workflow_file)
         prompt = build_prompt(
             workflow_name=workflow_name,
@@ -917,6 +936,7 @@ def run_workflow(
             local_date=local_date,
             athlete_timezone=config.athlete_timezone,
             athlete_context=athlete_context,
+            prompt_supplement=prompt_supplement,
         )
 
         # Execute Claude -> Validate structured output, with at most one
@@ -1060,6 +1080,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.workflow in WORKFLOW_ENTRY_POINTS:
+        print(json.dumps({"status": "failed", "error": f"run {args.workflow} via "
+                                                       f"{WORKFLOW_ENTRY_POINTS[args.workflow]}"}))
+        return 2
 
     repo_root_for_env = Path(args.repo_root).resolve() if args.repo_root else default_repo_root()
     env_file_path = Path(args.env_file) if args.env_file else (repo_root_for_env / "runner" / "config.env")

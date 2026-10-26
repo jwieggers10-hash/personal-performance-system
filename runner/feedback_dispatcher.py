@@ -130,6 +130,21 @@ def daily_review_settled(repo_root: Path, local_date: date) -> bool:
     return review.exists() and not daily_review_running(repo_root)
 
 
+# Claude-invoking workflows whose locks pause the dispatcher's own Claude calls.
+COORDINATED_WORKFLOW_LOCKS = ("daily-review-*.lock", "evening-nutrition-review-*.lock")
+
+
+def coaching_workflow_running(repo_root: Path) -> bool:
+    """A Daily Review or Evening Nutrition Review holds its lock. A lock left
+    by a dead or overdue run (WorkflowLock's own staleness rule) is ignored,
+    so a crashed run cannot pause feedback indefinitely."""
+    lock_dir = repo_root / "runtime" / "locks"
+    if not lock_dir.is_dir():
+        return False
+    return any(wr.WorkflowLock(lock_dir, path.stem, wr.DEFAULT_LOCK_STALE_SECONDS).is_held()
+               for pattern in COORDINATED_WORKFLOW_LOCKS for path in lock_dir.glob(pattern))
+
+
 # --------------------------------------------------------------------------
 # Telegram transport for simulation
 # --------------------------------------------------------------------------
@@ -265,7 +280,7 @@ class Dispatcher:
         self.log = log or (lambda **fields: None)
         self.owner = owner or uuid.uuid4().hex
         self.review_settled = review_settled or (lambda d: daily_review_settled(settings.repo_root, d))
-        self.review_running = review_running or (lambda: daily_review_running(settings.repo_root))
+        self.review_running = review_running or (lambda: coaching_workflow_running(settings.repo_root))
         self.auth_status = settings.auth_status or (
             lambda: fc.cli_auth_status(settings.claude_binary, cwd=settings.repo_root))
         self.counts: dict = {}
@@ -683,7 +698,7 @@ class Dispatcher:
         if self._claude_blocked:
             return self._claude_blocked
         if self.review_running():
-            return "daily_review_running"
+            return "coaching_workflow_running"
         preflight = self.preflight(now)
         if not preflight.ok:
             return preflight.reason

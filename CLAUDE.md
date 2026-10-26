@@ -28,7 +28,7 @@ This repository is a long-term AI performance coaching system, built in four pha
 - `data-source-policy.md` — which data source is authoritative for which metric, and duplicate-handling rules.
 - `integration-status.md` — verified status and known limitations of each AthleteData MCP integration (Garmin, Hevy, Cronometer, Apple Health).
 - `plans/running/`, `plans/strength/`, `plans/nutrition/` — reserved for concrete plans produced by future coaching work; currently empty.
-- `reviews/daily/`, `reviews/weekly/`, `reviews/monthly/` — reserved for periodic review records; currently empty.
+- `reviews/daily/`, `reviews/nutrition/`, `reviews/weekly/`, `reviews/monthly/` — periodic review records written by the runner; `reviews/nutrition/` is gitignored because it holds food-level data.
 - `race-preparation/`, `prompts/`, `logs/`, `config/` — reserved for future use; currently empty.
 
 ---

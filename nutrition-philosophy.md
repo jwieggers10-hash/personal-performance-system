@@ -42,6 +42,21 @@ Nutrition data reflects only what has actually been logged, using Cronometer as 
 
 ---
 
+## Targets
+
+Current calorie, macronutrient, fiber and body-weight targets are defined only in the Nutrition Targets section of `goals.md` — provisional, approved 2026-10-26, and due for reassessment after 2–3 weeks of sufficiently complete logs. They are reference points for coaching, not compliance thresholds, and a target is never a reason to under-fuel training.
+
+---
+
+## Energy Balance
+
+- Intake (Cronometer) and expenditure (Garmin) are both estimates; neither is treated as an exact measurement.
+- Garmin's daily expenditure is resting calories plus daily active calories. Workout calories are never added on top: they overlap the daily active figure.
+- Only completed days are compared directly. A day in progress has partial expenditure; any full-day figure for it is a labelled projection with a range, and a day whose food log looks incomplete gets no balance at all.
+- Judgements rest on multi-day trends of complete days and on the body-weight trend, not on a single day's balance.
+
+---
+
 ## Decision Rules
 
 - Prefer sustainable nutrition patterns over aggressive short-term changes.
@@ -66,6 +81,6 @@ A single day's log is not a valid basis for judging whether the approach is work
 
 This document defines nutrition philosophy only. It does not:
 
-- Prescribe specific meal plans or exact macro targets.
+- Prescribe specific meal plans, or hold the targets themselves (those live in `goals.md`).
 - Replace medical or dietetic advice.
 - Duplicate the authority definitions in `coaching-authority.md`.

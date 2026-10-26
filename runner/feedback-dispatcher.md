@@ -92,7 +92,7 @@ All decisions use Europe/Amsterdam wall time via `zoneinfo`, so they follow DST 
 
 - 22:00–07:30: routine work is not generated or sent. Events detected then are attached to one `morning_digest` batch for the next morning (release 07:30 local); events detected before the digest is generated join it.
 - 07:30–09:00: routine batches also wait until today's Daily Review has finished (`reviews/daily/<date>.md` exists and no `daily-review-*.lock`). From 09:00 they proceed regardless, so a failing Daily Review cannot block feedback.
-- No Claude call starts while a Daily Review lock exists.
+- No Claude call starts while a Daily Review or Evening Nutrition Review lock is held (`coaching_workflow_running`); a lock left by a dead or overdue run (the runner's own staleness rule) is ignored, so a crash cannot pause feedback indefinitely.
 - Only `urgent` alerts bypass quiet hours. Today that is `claude_auth_escalation` alone; the expiry and budget alerts are `attention` and wait for the morning.
 
 ---

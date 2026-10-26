@@ -278,7 +278,7 @@ class QuietHoursTests(DispatcherTestCase):
         self.add("g1")
         gateway = FakeGateway()
         counts = self.dispatcher(gateway=gateway, review_running=lambda: True).run(NOW)
-        self.assertEqual(counts["deferred_daily_review_running"], 1)
+        self.assertEqual(counts["deferred_coaching_workflow_running"], 1)
         self.assertEqual(gateway.prompts, [])
 
 

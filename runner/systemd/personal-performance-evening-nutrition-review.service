@@ -1,0 +1,34 @@
+[Unit]
+Description=Personal Performance System - Evening Nutrition Review (automated, one-shot)
+Documentation=file:///home/coach/personal-performance-system/workflows/evening-nutrition-review.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=coach
+Group=coach
+WorkingDirectory=/home/coach/personal-performance-system
+
+# Same configuration as the Daily Review: runner/config.env (Claude settings,
+# Telegram) and coach's own Claude Code login.
+EnvironmentFile=/home/coach/personal-performance-system/runner/config.env
+ExecStart=/usr/bin/python3 runner/evening_nutrition_review.py --mode automated
+
+# Retrying is a decision made outside the run (runner/workflow-runner.md).
+Restart=no
+# Facts (a few bounded AthleteData reads) + at most 25 min waiting for an
+# in-flight feedback dispatcher run + at most two Claude calls of
+# CLAUDE_TIMEOUT_SECONDS (600 s). Kept below LOCK_STALE_SECONDS (3600) so the
+# review's lock is never judged stale while it runs.
+TimeoutStartSec=55min
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# Claude Code must be able to refresh its own login under ~/.claude, so the
+# home directory stays writable (as for the Daily Review and dispatcher).
+
+SyslogIdentifier=evening-nutrition-review
+
+# No [Install] section: started only by personal-performance-evening-nutrition-review.timer.

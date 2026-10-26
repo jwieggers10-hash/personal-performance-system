@@ -9,3 +9,6 @@ runner/config.env
 # Operational runtime data (see phase3-workflow-spec.md Storage section)
 runtime/
 logs/
+
+# Nutrition reviews contain food-level personal data (runner/nutrition-workflows.md)
+reviews/nutrition/

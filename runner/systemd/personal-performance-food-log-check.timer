@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily 20:00 Europe/Amsterdam trigger for the Personal Performance food-log check
+
+[Timer]
+# Explicit time zone: DST-aware and independent of the server's UTC clock,
+# as for the Daily Review timer (19:00 UTC in winter, 18:00 UTC in summer).
+OnCalendar=*-*-* 20:00:00 Europe/Amsterdam
+AccuracySec=1min
+
+# A missed check is not replayed: a late reminder would be outdated. The
+# script itself also refuses to act outside 19:45-21:15 local.
+Persistent=false
+
+Unit=personal-performance-food-log-check.service
+
+[Install]
+WantedBy=timers.target

@@ -46,7 +46,7 @@ Documented in full in `integration-status.md`. In summary:
 
 - Garmin: per-lap/split detail and some sleep metrics (sleep score, HRV, SpO2) are not reliably available through current integration tools.
 - Hevy: set-level RPE is not recorded, and workout timestamps may reflect delayed logging rather than real-time tracking.
-- Cronometer: only current-day nutrition data was confirmed available; historical nutrition data could not be retrieved during testing.
+- Cronometer: historical data is available (re-verified 2026-10-26), but sync timing is irregular, meal times are placeholders, quick-add entries lack nutrient detail, and some days are only partially logged.
 - Apple Health: the originating app (FeelFit specifically, versus another app writing to Apple Health) cannot be confirmed from available data, and occasional duplicate same-date entries were observed.
 
 ## Coaching Assumptions
@@ -55,6 +55,6 @@ Based on verified Phase 1 results, the coaching system may safely assume:
 
 - Recent running data (distance, duration, pace, heart rate) retrieved from Garmin is reliable.
 - Recent strength session data (exercises, sets, reps, load) retrieved from Hevy is reliable.
-- Current-day nutrition totals from Cronometer are reliable when present; historical nutrition trends should not be assumed available without re-verification.
+- Cronometer nutrition totals are reliable for days whose log is complete; trends use fully logged days only.
 - Recent body-weight and body-fat data from Apple Health is usable for trend tracking provided duplicate same-date entries are excluded rather than averaged.
 - Any data field not explicitly confirmed as available during Phase 1 should be treated as unverified rather than assumed present.

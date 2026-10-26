@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read-only AthleteData MCP client for the detect-only event poller.
+"""Read-only AthleteData MCP client for the detect-only event poller and the
+deterministic parts of the nutrition workflows (runner/nutrition-workflows.md).
 
 Speaks the AthleteData MCP Streamable HTTP transport directly (stdlib only):
 initialize -> notifications/initialized -> tools/list -> tools/call. Verified
@@ -45,6 +46,11 @@ READ_ONLY_TOOL_ALLOWLIST = frozenset({
     "garmin_get_activities",
     "hevy_get_workout_events",
     "apple_health_get_body_composition",
+    # Nutrition workflows (runner/nutrition-workflows.md); all annotated
+    # readOnlyHint=true by the server, verified 2026-10-26.
+    "food_log_get",
+    "garmin_get_daily_summaries",
+    "hevy_get_workouts",
 })
 
 DEFAULT_TIMEOUT_SECONDS = 30

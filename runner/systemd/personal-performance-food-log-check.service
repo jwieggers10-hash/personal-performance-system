@@ -1,0 +1,36 @@
+[Unit]
+Description=Personal Performance System - 20:00 Cronometer food-log check (deterministic, one-shot)
+Documentation=file:///home/coach/personal-performance-system/runner/nutrition-workflows.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=coach
+Group=coach
+WorkingDirectory=/home/coach/personal-performance-system
+
+# Needs the Telegram settings in runner/config.env. No Claude: the whole
+# ~/.claude directory stays inaccessible. The AthleteData MCP endpoint is read
+# at runtime from coach's ~/.claude.json (a file, not inside ~/.claude),
+# read-only via ProtectHome, and never copied anywhere.
+EnvironmentFile=/home/coach/personal-performance-system/runner/config.env
+ExecStart=/usr/bin/python3 runner/food_log_check.py --once
+
+# At most one reminder per local day, recorded in runtime/food-log-check/
+# before sending; a failed run is not retried automatically.
+Restart=no
+# One food-log read (three bounded HTTP attempts) plus at most two Telegram
+# attempts with a delay of up to 60 s.
+TimeoutStartSec=300
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/coach/personal-performance-system/runtime
+InaccessiblePaths=-/home/coach/.claude
+
+SyslogIdentifier=food-log-check
+
+# No [Install] section: started only by personal-performance-food-log-check.timer.
