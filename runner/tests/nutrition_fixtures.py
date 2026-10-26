@@ -115,6 +115,18 @@ class FakeClient:
         self.verify_error = verify_error
         self.calls: list = []
 
+    WRITE_TOOLS = {"food_log_entry": {"readOnlyHint": False, "destructiveHint": False},
+                   "food_log_delete": {"readOnlyHint": False, "destructiveHint": True},
+                   "push_workout_to_watch": {}}  # unannotated: never treated as read-only
+
+    def list_tools(self):
+        if self.verify_error:
+            raise self.verify_error
+        tools = {n: {"name": n, "annotations": {"readOnlyHint": True, "destructiveHint": False}}
+                 for n in self.responses}
+        tools.update({n: {"name": n, "annotations": a} for n, a in self.WRITE_TOOLS.items()})
+        return tools
+
     def verify_tools(self, names):
         if self.verify_error:
             raise self.verify_error

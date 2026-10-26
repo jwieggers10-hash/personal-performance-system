@@ -48,6 +48,37 @@ DISPATCHER_MAX_WAIT = timedelta(minutes=25)
 DISPATCHER_POLL_SECONDS = 15
 
 
+MCP_TOOL_PREFIX = f"mcp__{adc.MCP_SERVER_NAME}__"
+BUILTIN_TOOLS = "Read"  # governing documents and the workflow definition; nothing else built in
+
+
+def build_tool_policy(client_factory: Callable[[], Any], log: Callable[..., None] = lambda **f: None
+                      ) -> wr.ClaudeToolPolicy:
+    """Enforced read-only access for the review's Claude invocations, built
+    from the server's own annotations at run time: only Read and AthleteData
+    tools annotated readOnlyHint=true (and not destructive) are allowed
+    (dontAsk denies everything else); every other AthleteData tool is also
+    explicitly denied. If the tool list cannot be read, the whole AthleteData
+    server is denied (fail closed) and the review relies on its facts."""
+    try:
+        listed = client_factory().list_tools()
+    except adc.AthleteDataError as exc:
+        log(event="tool_policy", outcome="fail_closed", error_category=nd._error_category(exc))
+        return wr.ClaudeToolPolicy(tools=BUILTIN_TOOLS, permission_mode="dontAsk", allowed_tools=BUILTIN_TOOLS,
+                                   disallowed_tools=f"mcp__{adc.MCP_SERVER_NAME}")
+    read_only, other = [], []
+    for name, tool in sorted(listed.items()):
+        annotations = tool.get("annotations") or {} if isinstance(tool, dict) else {}
+        safe = annotations.get("readOnlyHint") is True and annotations.get("destructiveHint") is not True
+        (read_only if safe else other).append(MCP_TOOL_PREFIX + name)
+    log(event="tool_policy", outcome="read_only", allowed_mcp_tools=len(read_only), denied_mcp_tools=len(other))
+    return wr.ClaudeToolPolicy(
+        tools=BUILTIN_TOOLS, permission_mode="dontAsk",
+        allowed_tools=",".join([BUILTIN_TOOLS] + read_only),
+        # Never empty: a deny rule for a tool that does not exist is harmless.
+        disallowed_tools=",".join(other) or MCP_TOOL_PREFIX + "food_log_entry")
+
+
 def wait_for_dispatcher(repo_root: Path, *, sleep_fn: Callable[[float], None] = time_module.sleep,
                         monotonic: Callable[[], float] = time_module.monotonic,
                         log: Callable[..., None] = lambda **f: None,
@@ -144,9 +175,10 @@ def main(argv: Optional[list] = None, *, now_fn: Optional[Callable[[], datetime]
         print(json.dumps({"workflow": WORKFLOW, "status": "skipped", "reason": "outside_window"}))
         return 0
 
-    prepare = make_prepare(config.repo_root, tz, client_factory=factory, sleep_fn=sleep_fn,
-                           log=lambda **fields: wr.log_event(config, workflow=WORKFLOW, **fields))
-    result = wr.run_workflow(WORKFLOW, args.mode, config, now=now, prepare_prompt=prepare)
+    log = lambda **fields: wr.log_event(config, workflow=WORKFLOW, **fields)  # noqa: E731
+    prepare = make_prepare(config.repo_root, tz, client_factory=factory, sleep_fn=sleep_fn, log=log)
+    result = wr.run_workflow(WORKFLOW, args.mode, config, now=now, prepare_prompt=prepare,
+                             tool_policy_factory=lambda: build_tool_policy(factory, log=log))
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["status"] in ("completed", "completed_with_limitations", "duplicate_skipped") else 1
 

@@ -253,9 +253,9 @@ class AthleteDataClient:
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, expect_response=False)
         self._initialized = True
 
-    def verify_tools(self, names) -> dict:
-        """Returns {name: None if usable, else the AthleteDataError}. Callers
-        isolate failures per source, so one bad tool never blocks the rest."""
+    def list_tools(self) -> dict:
+        """{name: tool definition} for every tool the server offers. Read-only
+        (tools/list); calls nothing."""
         self.initialize()
         listed: dict = {}
         cursor = None
@@ -267,6 +267,12 @@ class AthleteDataClient:
             cursor = result.get("nextCursor")
             if not cursor:
                 break
+        return listed
+
+    def verify_tools(self, names) -> dict:
+        """Returns {name: None if usable, else the AthleteDataError}. Callers
+        isolate failures per source, so one bad tool never blocks the rest."""
+        listed = self.list_tools()
 
         outcome: dict = {}
         for name in names:

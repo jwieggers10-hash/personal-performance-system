@@ -537,25 +537,42 @@ def build_structured_output_json_schema() -> dict:
     return {"type": "object", "properties": properties, "required": required}
 
 
+@dataclass(frozen=True)
+class ClaudeToolPolicy:
+    """An enforced tool restriction for one Claude invocation, replacing the
+    configured permission mode and allowed tools. With permission_mode
+    "dontAsk" only allowed_tools can run; disallowed_tools are denied in every
+    mode; `tools` limits the built-in tool set (MCP tools are unaffected)."""
+    tools: str
+    permission_mode: str
+    allowed_tools: str
+    disallowed_tools: str
+
+
 def invoke_claude(prompt: str, config: RunnerConfig,
-                  json_schema: Optional[dict] = None) -> subprocess.CompletedProcess:
+                  json_schema: Optional[dict] = None,
+                  tool_policy: Optional[ClaudeToolPolicy] = None) -> subprocess.CompletedProcess:
     """json_schema defaults to the Daily Review contract; other callers (the
-    feedback dispatcher) pass their own."""
+    feedback dispatcher) pass their own. Without tool_policy the argv is the
+    one the Daily Review and dispatcher have always used."""
     argv = [
         config.claude_binary,
         "--print",
         "--output-format", "json",
-        "--permission-mode", config.permission_mode,
+        "--permission-mode", tool_policy.permission_mode if tool_policy else config.permission_mode,
         # --allowedTools is variadic in the Claude Code CLI (accepts <tools...>);
         # passed as two argv elements it would swallow the prompt argument that
         # follows. The "=" form keeps it a single argv element.
-        f"--allowedTools={config.allowed_tools}",
+        f"--allowedTools={tool_policy.allowed_tools if tool_policy else config.allowed_tools}",
         # --json-schema is a single-value (non-variadic) flag, so it's safe as
         # two argv elements. Enforces the Structured Result Contract's shape
         # at the CLI boundary -- see build_structured_output_json_schema().
         "--json-schema", json.dumps(json_schema if json_schema is not None
                                     else build_structured_output_json_schema()),
     ]
+    if tool_policy:
+        # Both variadic as well, hence the "=" form.
+        argv += [f"--tools={tool_policy.tools}", f"--disallowedTools={tool_policy.disallowed_tools}"]
     if config.claude_model:
         argv += ["--model", config.claude_model]
     if config.max_budget_usd:
@@ -832,10 +849,13 @@ def run_workflow(
     athlete_context: Optional[str] = None,
     now: Optional[datetime] = None,
     prepare_prompt: Optional[Callable[[datetime], Optional[str]]] = None,
+    tool_policy_factory: Optional[Callable[[], ClaudeToolPolicy]] = None,
 ) -> dict:
     """prepare_prompt, when given, runs under the workflow lock after the
     duplicate check and before Claude; its text is added to the prompt (the
-    Evening Nutrition Review passes its computed facts this way)."""
+    Evening Nutrition Review passes its computed facts this way).
+    tool_policy_factory, when given, is evaluated at the same point and its
+    policy is enforced on every Claude invocation of the run."""
     exec_id = execution_id()
     started_at = datetime.now(dt_timezone.utc)
 
@@ -927,6 +947,7 @@ def run_workflow(
             return result
 
         prompt_supplement = prepare_prompt(local_dt) if prepare_prompt else None
+        tool_policy = tool_policy_factory() if tool_policy_factory else None
         governing_documents = parse_governing_documents(workflow_file)
         prompt = build_prompt(
             workflow_name=workflow_name,
@@ -958,7 +979,8 @@ def run_workflow(
             log_event(config, event="claude_invoke_start", workflow=workflow_name, execution_id=exec_id,
                       attempt=attempt)
             try:
-                completed = invoke_claude(attempt_prompt, config)
+                completed = (invoke_claude(attempt_prompt, config, tool_policy=tool_policy) if tool_policy
+                             else invoke_claude(attempt_prompt, config))
             except subprocess.TimeoutExpired:
                 result["error"] = "Claude execution timed out"
                 log_event(config, event="workflow_end", workflow=workflow_name, execution_id=exec_id,

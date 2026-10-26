@@ -80,6 +80,7 @@ class EveningTestCase(unittest.TestCase):
                                  "TELEGRAM_BOT_TOKEN=123456:SYNTHETIC-token-value\nTELEGRAM_CHAT_ID=999000111\n")
         self.transport = FakeTelegram()
         self.prompts: list = []
+        self.policies: list = []
         self.client_calls = 0
 
     def tearDown(self):
@@ -94,8 +95,9 @@ class EveningTestCase(unittest.TestCase):
     def run_main(self, *outputs, now=EVENING, mode="automated", factory=None, transport=None, extra=()):
         outputs = list(outputs) or [claude_ok(structured())]
 
-        def fake_invoke(prompt, config, json_schema=None):
+        def fake_invoke(prompt, config, json_schema=None, tool_policy=None):
             self.prompts.append(prompt)
+            self.policies.append(tool_policy)
             step = outputs.pop(0)
             if isinstance(step, BaseException):
                 raise step
@@ -240,6 +242,78 @@ class EveningRunTests(EveningTestCase):
             self.assertTrue((REPO_ROOT / doc).exists(), doc)
 
 
+class ToolPolicyTests(EveningTestCase):
+    def config(self):
+        return wr.RunnerConfig(repo_root=self.root, athlete_timezone="Europe/Amsterdam",
+                               claude_binary="/nonexistent/claude")
+
+    def argv(self, **kwargs):
+        with mock.patch.object(wr.subprocess, "run") as run:
+            wr.invoke_claude("PROMPT", self.config(), **kwargs)
+        return run.call_args.args[0]
+
+    def test_without_policy_the_argv_is_unchanged(self):
+        argv = self.argv()
+        self.assertEqual(argv[:7], ["/nonexistent/claude", "--print", "--output-format", "json",
+                                    "--permission-mode", "bypassPermissions",
+                                    "--allowedTools=Read,mcp__athletedata__*"])
+        self.assertFalse(any(a.startswith(("--tools", "--disallowedTools")) for a in argv))
+        self.assertEqual(argv[-1], "PROMPT")
+
+    def test_policy_replaces_permission_mode_and_tools(self):
+        policy = wr.ClaudeToolPolicy(tools="Read", permission_mode="dontAsk",
+                                     allowed_tools="Read,mcp__athletedata__food_log_get",
+                                     disallowed_tools="mcp__athletedata__food_log_entry")
+        argv = self.argv(tool_policy=policy)
+        self.assertNotIn("bypassPermissions", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        for flag in ("--allowedTools=Read,mcp__athletedata__food_log_get", "--tools=Read",
+                     "--disallowedTools=mcp__athletedata__food_log_entry"):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[-1], "PROMPT")
+
+    def test_policy_allows_only_server_annotated_read_tools(self):
+        policy = enr.build_tool_policy(lambda: FakeClient(standard_responses()))
+        allowed = policy.allowed_tools.split(",")
+        denied = policy.disallowed_tools.split(",")
+        self.assertEqual((policy.tools, policy.permission_mode, allowed[0]), ("Read", "dontAsk", "Read"))
+        self.assertIn("mcp__athletedata__food_log_get", allowed)
+        for write_tool in ("food_log_entry", "food_log_delete", "push_workout_to_watch"):
+            self.assertIn("mcp__athletedata__" + write_tool, denied)
+            self.assertNotIn("mcp__athletedata__" + write_tool, allowed)
+        self.assertFalse(set(allowed) & set(denied))
+
+    def test_policy_fails_closed(self):
+        for factory in (lambda: FakeClient({}, verify_error=adc.HTTPStatusError(503)),
+                        lambda: (_ for _ in ()).throw(adc.CredentialUnavailableError("synthetic"))):
+            policy = enr.build_tool_policy(factory)
+            self.assertEqual((policy.allowed_tools, policy.disallowed_tools, policy.permission_mode),
+                             ("Read", "mcp__athletedata", "dontAsk"))
+
+    def test_every_invocation_of_the_review_is_restricted(self):
+        bad = subprocess.CompletedProcess([], 0, stdout="not json", stderr="")
+        self.run_main(bad, claude_ok(structured()))
+        self.assertEqual(len(self.policies), 2)
+        for policy in self.policies:
+            self.assertEqual((policy.permission_mode, policy.tools), ("dontAsk", "Read"))
+            self.assertIn("mcp__athletedata__food_log_entry", policy.disallowed_tools)
+
+    def test_duplicate_run_builds_no_policy(self):
+        self.run_main()
+        self.run_main(now=local("2026-10-26 21:45"))
+        self.assertEqual(len(self.policies), 1)
+
+    def test_daily_review_is_invoked_without_a_policy(self):
+        (self.root / "workflows" / "daily-review.md").write_text("# Daily Review\n\n## Governing Documents\n\n- `goals.md`\n")
+        completed = claude_ok(structured(workflow="daily-review"))
+        with mock.patch.object(wr, "invoke_claude", return_value=completed) as invoke, \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = wr.run_workflow("daily-review", "automated", self.config(), now=EVENING.astimezone(UTC))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(invoke.call_args.kwargs, {})
+        self.assertEqual(len(invoke.call_args.args), 2)
+
+
 class CoordinationTests(EveningTestCase):
     def lock_dir(self) -> Path:
         return self.root / "runtime" / "locks"
@@ -283,7 +357,7 @@ class CoordinationTests(EveningTestCase):
 
         outputs = [claude_ok(structured())]
 
-        def fake_invoke(prompt, config, json_schema=None):
+        def fake_invoke(prompt, config, json_schema=None, tool_policy=None):
             order.append("claude")
             # While the review runs, its lock pauses the dispatcher's Claude calls.
             order.append(("dispatcher_gate", fd.coaching_workflow_running(self.root)))

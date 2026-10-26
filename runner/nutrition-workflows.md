@@ -63,6 +63,17 @@ From `garmin_get_daily_summaries` only: total = resting (`bmrKilocalories`) + ac
 
 Everything else is the runner's, unchanged: one review per local date (`reviews/nutrition/<date>.md`, gitignored), `duplicate_skipped` without facts or Claude for a second automated run, one corrective retry for malformed output, classified Claude failures (authentication, quota, execution, timeout) ending as `failed` with one urgent Telegram notice and no automatic retry, and Telegram delivery with one retry for transient errors. An automated run outside 21:00–23:45 local does nothing. `workflow_runner.py --workflow evening-nutrition-review` is refused: the review always needs its facts.
 
+### Read-only enforcement
+
+Every Claude invocation of the review (including the corrective retry) runs with an enforced tool policy instead of the configured `bypassPermissions` (`evening_nutrition_review.build_tool_policy`, `workflow_runner.ClaudeToolPolicy`), built from the AthleteData server's own annotations when Claude is about to be called:
+
+- `--tools=Read`: the only built-in tool; no Bash, Write, Edit or web access.
+- `--permission-mode dontAsk` with `--allowedTools` = `Read` plus every AthleteData tool annotated `readOnlyHint=true` and not destructive: anything else is refused, including tools of other connected MCP servers.
+- `--disallowedTools` = every other AthleteData tool (deny rules win in every mode).
+- If the tool list cannot be read, the whole AthleteData server is denied and the review relies on its facts (fail closed).
+
+Verified against the production CLI (2.1.310) on 2026-10-26: only `Read` and the 73 read-only AthleteData tools were exposed, none of the 17 write tools; a deliberately unlisted read-only tool was refused ("denied because Claude Code is running in don't ask mode"). The Daily Review and feedback dispatcher are unchanged and still run with `bypassPermissions`.
+
 ### Coordination with the feedback dispatcher
 
 - The review's lock (`runtime/locks/evening-nutrition-review-<date>.lock`) pauses the dispatcher's Claude calls exactly as the Daily Review's does (`feedback_dispatcher.coaching_workflow_running`); stale locks are ignored.
