@@ -401,6 +401,30 @@ class FactsTests(unittest.TestCase):
         self.assertEqual(f["recent_trends"]["mean_energy_balance_kcal_completed_days"], 2400 - 2733)
         json.dumps(f)  # serialisable for the prompt
 
+    def test_trend_counts_use_fully_logged_days_as_denominator(self):
+        responses = standard_responses()
+        partial_days = {TODAY - timedelta(days=1), TODAY - timedelta(days=2)}
+        low_protein = {TODAY - timedelta(days=d) for d in (3, 4, 5)}
+        entries = []
+        for offset in range(1, 15):
+            day = TODAY - timedelta(days=offset)
+            if day in partial_days:
+                entries.append(food_entry(day, "breakfast", 500, protein=40))
+            else:
+                entries += usual_day(day, protein_per_slot=30.0 if day in low_protein else 45.0)
+        responses["food_log_get"] = food_page(entries + usual_day(TODAY), local("2026-10-26 19:42"))
+        trends = self.facts(responses)["recent_trends"]
+        self.assertEqual((trends["complete_log_days"], trends["of_days"]), (5, 7))
+        self.assertEqual(trends["days_protein_at_or_above_min"], 2)
+        self.assertEqual(trends["protein_min_met_statement"], "Protein reached 150 g on 2 of 5 fully logged days")
+        self.assertNotIn("of 7", trends["protein_min_met_statement"])
+
+    def test_workflow_requires_fully_logged_denominators(self):
+        text = (REPO_ROOT / "workflows" / "evening-nutrition-review.md").read_text(encoding="utf-8")
+        self.assertIn("never out of the calendar days", text)
+        self.assertIn("protein_min_met_statement", text)
+        self.assertIn('Never write "2 of 7 days"', text)
+
     def test_incomplete_log_gets_no_balance(self):
         partial = [e for e in usual_day(TODAY) if e["mealType"] == "breakfast"]
         f = self.facts(standard_responses(partial))

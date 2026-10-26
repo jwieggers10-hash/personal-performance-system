@@ -802,6 +802,11 @@ def build_facts(inputs: Inputs, targets: Optional[dict], target: date, now: date
                                                  if d.protein_g >= targets["protein_g"]["min"])
                                              if targets else None),
         })
+        if targets:
+            # The denominator is always the fully logged days, never the calendar days.
+            trends["protein_min_met_statement"] = (
+                f"Protein reached {targets['protein_g']['min']} g on {trends['days_protein_at_or_above_min']} "
+                f"of {len(intake_days)} fully logged day{'s' if len(intake_days) != 1 else ''}")
     if len(balances) >= 3:
         trends["mean_energy_balance_kcal_completed_days"] = round(statistics.fmean(balances))
         trends["energy_balance_days_used"] = len(balances)

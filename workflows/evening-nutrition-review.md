@@ -63,6 +63,8 @@ The prompt contains a JSON facts block computed by the runner from read-only Ath
   - `status` `missing` / `unavailable`: say Garmin expenditure is unavailable today.
 - `energy_balance_today` — present only when the log is complete **and** a projection exists. It is a projected, provisional range; never present a single exact deficit or surplus. When unavailable, say why (from `reason`).
 - `recent_days` and `recent_trends` — the previous seven days. Energy balances exist only for days with a complete log and a completed Garmin day. Use trends only when `complete_log_days` is at least 4; otherwise say the logs are too incomplete for a trend.
+  - **Denominators:** every nutrition trend count is out of the fully logged days (`complete_log_days`), never out of the calendar days. Quote `protein_min_met_statement` as given, for example "Protein reached 150 g on 2 of 5 fully logged days". Never write "2 of 7 days" when only 5 days are fully logged; partially logged days count neither for nor against a target.
+  - Means (`mean_intake_kcal_complete_days`, `mean_protein_g_complete_days`) and the balance mean (`energy_balance_days_used` days) are likewise "over N fully logged days".
 - `body_composition` — the weight trend (`slope_per_week`, `versus_target`) is meaningful only when `sufficient` is true. Body fat is a noisy scale estimate: mention its direction at most, never a single reading. Dates with conflicting duplicate readings are already excluded.
 - `sources` — any `error:` entry is an integration failure to report.
 
@@ -106,7 +108,7 @@ Garmin: <observed so far> · projected <low–high> (if available)
 Balance: <projected range, or why none>
 Body composition: <weight trend vs target; body fat direction at most>
 Fuel & recovery: <one line for the day type>
-Last 7 days: <complete-day count; mean intake and protein; balance trend if usable>
+Last 7 days: <N> of 7 fully logged · over those <N>: mean <kcal>, <g> protein · <protein_min_met_statement> · balance <mean> over <energy_balance_days_used> days (if usable)
 Tomorrow: <exactly one specific, actionable improvement>
 ```
 
